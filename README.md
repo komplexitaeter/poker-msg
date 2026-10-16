@@ -47,6 +47,10 @@ and then follow this steps:
  sudo systemctl enable supervisor #might be done already
  ```
 
+The server pings every client every 30 seconds and closes connections that did not answer the previous ping
+(dead tabs, sleeping laptops, connections dropped by proxies). The interval can be changed with the environment
+variable `POKER_MSG_KEEPALIVE` (seconds), e.g. `environment = POKER_MSG_KEEPALIVE="30"` in the supervisor config.
+
 Here is an example supervisor config:
  ```
  [program:poker-msg]

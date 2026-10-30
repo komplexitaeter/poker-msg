@@ -3,6 +3,7 @@ use Ratchet\WebSocket\WsServer;
 use Ratchet\Http\HttpServer;
 use Ratchet\Server\IoServer;
 use PokerMsg\MsgServer;
+use PokerMsg\NotifySocket;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -24,6 +25,7 @@ $notifyPort = (int)(getenv('POKER_MSG_NOTIFY_PORT') ?: 8444);
 $msgServer = new MsgServer;
 $ws = new WsServer($msgServer);
 $server = IoServer::factory(new HttpServer($ws), $wsPort, '127.0.0.1');
+$msgServer->setLoop($server->loop);
 $ws->enableKeepAlive($server->loop, $keepAliveInterval);
 
 if ($heartbeatInterval > 0) {
@@ -33,12 +35,11 @@ if ($heartbeatInterval > 0) {
 }
 
 // A failing bind (e.g. port in use) is logged; the WebSocket server keeps running without the notify channel.
-$udp = @stream_socket_server("udp://127.0.0.1:$notifyPort", $errno, $errstr, STREAM_SERVER_BIND);
-if ($udp === false) {
-    $msgServer->logMsg("ERROR: notify channel udp://127.0.0.1:$notifyPort not available ($errno: $errstr), continuing without it");
+$notify = NotifySocket::open($notifyPort);
+if ($notify->stream === null) {
+    $msgServer->logMsg("ERROR: notify channel udp://127.0.0.1:$notifyPort not available ({$notify->error}), continuing without it");
 } else {
-    stream_set_blocking($udp, false);
-    $server->loop->addReadStream($udp, function ($udp) use ($msgServer) {
+    $server->loop->addReadStream($notify->stream, function ($udp) use ($msgServer) {
         // One datagram per call (the loop calls again while more are queued). 256 bytes is plenty for
         // "pull:" + 80 characters; longer datagrams are truncated and then rejected by the length check.
         $data = @stream_socket_recvfrom($udp, 256);
@@ -46,11 +47,14 @@ if ($udp === false) {
             try {
                 $msgServer->onNotify($data);
             } catch (\Throwable $e) {
-                $msgServer->logMsg("ERROR: notification failed: {$e->getMessage()}");
+                $msgServer->logMsg("ERROR: notification failed: " . MsgServer::forLog($e->getMessage(), 300));
             }
         }
     });
     $msgServer->logMsg("Notify channel listening on udp://127.0.0.1:$notifyPort");
+    if (!$notify->exclusive) {
+        $msgServer->logMsg("WARNING: PHP extension sockets missing, notify port is not bound exclusively (other local processes could bind it too)");
+    }
 }
 
 $msgServer->logMsg("WebSocket server listening on 127.0.0.1:$wsPort (keepalive {$keepAliveInterval}s, heartbeat {$heartbeatInterval}s)");

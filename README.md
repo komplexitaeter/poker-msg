@@ -64,13 +64,17 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 
 * Address: `udp://127.0.0.1:8444` (always localhost; port via `POKER_MSG_NOTIFY_PORT`).
 * Format: one datagram `pull:<team_id>`, e.g. `pull:Team_4b`. The team id has at most 80 printable ASCII characters
-  without whitespace; anything else is ignored (and logged as "Ignored invalid notification").
+  without whitespace; anything else is ignored. Invalid datagrams are logged at most once per minute (with a count).
 * Effect: every connection subscribed to that team receives `pull`, exactly like after a `push` from the browser
-  (which keeps working).
+  (which keeps working). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
+  the end of the 100 ms window (so the last change is always loaded).
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
-* Security: bound to 127.0.0.1 only, so only processes on the same host can send. The worst a local sender can do is
-  trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket server
-  keeps running without this channel.
+* Security: bound to 127.0.0.1 only, but **every local process (any user) can send**. The worst a local sender can do
+  is trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket
+  server keeps running without this channel.
+* Exclusive bind needs the PHP extension `sockets` (check: `php8.4 -m | grep sockets`). With it the port is bound
+  without `SO_REUSEADDR`, so no other local process can bind the same port and read the notifications. Without it
+  poker-msg falls back to `stream_socket_server()` (PHP always sets `SO_REUSEADDR` there) and logs a `WARNING`.
 
 Sending from PHP:
 

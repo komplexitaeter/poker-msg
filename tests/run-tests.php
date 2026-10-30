@@ -152,6 +152,9 @@ check(MsgServer::parseNotify('pull:' . str_repeat('a', 81)) === null, '81 charac
 check(MsgServer::parseNotify("pull:a b") === null, 'whitespace rejected');
 check(MsgServer::parseNotify("pull:a\x00b") === null, 'control characters rejected');
 check(MsgServer::parseNotify("pull:t\xC3\xA4m") === null, 'non-ASCII rejected');
+check(MsgServer::parseTeamId(' Team_4b ') === 'Team_4b', 'parseTeamId trims (client sends "subscribe: <id>")');
+check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line breaks and control characters');
+check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
 
 /* ---------- integration: running server ---------- */
 
@@ -175,6 +178,40 @@ try {
     check(in_array('pull', $ra1, true) && in_array('pull', $ra2, true), 'browser push still reaches the team (incl. sender)');
     check(!in_array('pull', $rb1, true), 'browser push does not reach other teams');
 
+    // exclusive bind: another local socket must not get the port (B-81, needs ext-sockets)
+    if (function_exists('socket_create')) {
+        $second = @stream_socket_server('udp://127.0.0.1:' . NOTIFY_PORT, $errno, $errstr, STREAM_SERVER_BIND);
+        check($second === false, 'second bind with SO_REUSEADDR on the notify port fails');
+        $sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+        check(@socket_bind($sock, '127.0.0.1', NOTIFY_PORT) === false, 'second plain bind on the notify port fails');
+        socket_close($sock);
+    } else {
+        echo "  skip exclusive bind (sockets extension missing)\n";
+    }
+
+    // several notifications for one team within 100 ms: one pull now, one trailing pull
+    usleep(150000);
+    for ($i = 0; $i < 5; $i++) udp(NOTIFY_PORT, 'pull:teamA');
+    $burst = count(array_filter($a1->receive(0.5), fn($m) => $m === 'pull'));
+    check($burst === 2, "5 notifications within 100 ms give 2 pulls (got $burst)");
+    $a2->receive(0.05); $b1->receive(0.05);
+
+    // WebSocket messages: exact "push" only, validated subscriptions
+    $a1->send("push\nFAKE LOG LINE");
+    $a1->send('xpush');
+    check(!in_array('pull', $a2->receive(0.4), true), 'only the exact message "push" triggers a pull');
+    $bad = new WsClient(WS_PORT);
+    $bad->send('subscribe: ' . str_repeat('a', 81));
+    $bad->send('push');
+    check(!in_array('pull', $bad->receive(0.4), true), 'subscription with invalid team id is ignored');
+    $bad->close();
+    $nospace = subscribed(WS_PORT, 'teamD');
+    $nospace->send('subscribe:teamD');
+    usleep(100000);
+    udp(NOTIFY_PORT, 'pull:teamD');
+    check(in_array('pull', $nospace->receive(0.4), true), 'subscribe without space still works');
+    $nospace->close();
+
     udp(NOTIFY_PORT, 'garbage');
     udp(NOTIFY_PORT, 'pull:' . str_repeat('x', 300));
     udp(NOTIFY_PORT, "pull:\x00\xff");
@@ -196,7 +233,10 @@ try {
     $logText = file_get_contents($log);
     check(!preg_match('/\bhb\b/', $logText), 'heartbeats are not logged');
     check(str_contains($logText, "Notify channel listening on udp://127.0.0.1:" . NOTIFY_PORT), 'notify channel logged at start');
-    check(str_contains($logText, 'Ignored invalid notification'), 'invalid datagram logged');
+    check(substr_count($logText, 'invalid notification(s)') === 1, 'invalid datagrams logged once per minute');
+    check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
+    check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');
+    check(!str_contains($logText, 'WARNING: PHP extension sockets missing') || !function_exists('socket_create'), 'no fallback warning when sockets is available');
 } finally {
     stopServer($proc);
 }

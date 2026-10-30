@@ -4,17 +4,36 @@ use DateTime;
 use Exception;
 use Ratchet\MessageComponentInterface;
 use Ratchet\ConnectionInterface;
+use React\EventLoop\LoopInterface;
 
 class MsgServer implements MessageComponentInterface {
     protected $users;
     protected $user_cons;
     protected $user_subs;
 
+    // B-81: pulls for the same team within this window (seconds) are merged into one trailing pull
+    public const NOTIFY_WINDOW = 0.1;
+    // B-81: invalid notifications are logged at most once per this interval (seconds)
+    public const INVALID_LOG_INTERVAL = 60;
+
+    private ?LoopInterface $loop = null;
+    /** @var array<string, float> team id => time of the last pull sent for a notification */
+    private array $lastNotify = [];
+    /** @var array<string, int> team id => notifications merged into the scheduled trailing pull */
+    private array $pendingNotify = [];
+    private int $invalidCount = 0;
+    private float $invalidLoggedAt = 0.0;
+
     public function __construct() {
         $this->logMsg("Starting up MsgServer");
         $this->users = Array();
         $this->user_cons = Array();
         $this->user_subs = Array();
+    }
+
+    /** Event loop for timers (merging notifications); without it every notification is sent at once. */
+    public function setLoop(LoopInterface $loop): void {
+        $this->loop = $loop;
     }
 
     public function onOpen(ConnectionInterface $conn) {
@@ -24,17 +43,20 @@ class MsgServer implements MessageComponentInterface {
     }
 
     public function onMessage(ConnectionInterface $from, $msg) {
-        $msg = trim($msg);
-        $this->logMsg("New message from $from->resourceId is: $msg");
-        if (str_contains($msg, 'subscribe:')) {
-            $team = trim(str_replace('subscribe:','', $msg));
-            if (strlen($team)>0) {
+        $msg = trim((string)$msg);
+        $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
+        // The client sends exactly "subscribe: <team_id>" and "push" (script.js).
+        if (str_starts_with($msg, 'subscribe:')) {
+            $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
+            if ($team === null) {
+                $this->logMsg(".. ignored subscription with invalid team id from $from->resourceId");
+            } else {
                 $this->logMsg(".. added subscription on team '$team' for $from->resourceId");
                 $this->user_cons[$from->resourceId] = $from;
                 $this->user_subs[$from->resourceId] = $team;
                 $this->logActiveTeams();
             }
-        } else if (str_contains($msg, 'push')) {
+        } else if ($msg === 'push') {
 
             if (isset($this->user_subs[$from->resourceId])) {
                 $team = $this->user_subs[$from->resourceId];
@@ -67,23 +89,65 @@ class MsgServer implements MessageComponentInterface {
     public function onNotify(string $data): void {
         $team = self::parseNotify($data);
         if ($team === null) {
-            $this->logMsg("Ignored invalid notification (" . strlen($data) . " bytes)");
+            $this->invalidCount++;
+            $now = microtime(true);
+            if ($now - $this->invalidLoggedAt >= self::INVALID_LOG_INTERVAL) {
+                $this->logMsg("Ignored {$this->invalidCount} invalid notification(s), last one " . strlen($data) . " bytes");
+                $this->invalidCount = 0;
+                $this->invalidLoggedAt = $now;
+            }
             return;
         }
-        $this->logMsg("New notification: pull for team '$team'");
+
+        if (isset($this->pendingNotify[$team])) {
+            $this->pendingNotify[$team]++;     // a trailing pull is already scheduled
+            return;
+        }
+        $now = microtime(true);
+        $since = $now - ($this->lastNotify[$team] ?? 0.0);
+        if ($this->loop === null || $since >= self::NOTIFY_WINDOW) {
+            $this->sendNotifyPull($team, 1);
+            return;
+        }
+        // Same team again within the window: one pull at the end of the window. It must not be
+        // dropped, because the earlier pull may have been read before this change was written.
+        $this->pendingNotify[$team] = 1;
+        $this->loop->addTimer(self::NOTIFY_WINDOW - $since, function () use ($team) {
+            $cnt = $this->pendingNotify[$team] ?? 1;
+            unset($this->pendingNotify[$team]);
+            $this->sendNotifyPull($team, $cnt);
+        });
+    }
+
+    private function sendNotifyPull(string $team, int $merged): void {
+        $now = microtime(true);
+        $this->lastNotify[$team] = $now;
+        if (count($this->lastNotify) > 1000) {   // keep the map small: forget teams outside the window
+            $this->lastNotify = array_filter($this->lastNotify, fn($t) => $now - $t < self::NOTIFY_WINDOW);
+        }
+        $this->logMsg("New notification: pull for team '$team'" . ($merged > 1 ? " ($merged merged)" : ""));
         $this->pullTeam($team);
+    }
+
+    /** Printable, shortened version of client input for the log (no line breaks or control characters). */
+    public static function forLog(string $text, int $max = 120): string {
+        $clean = preg_replace('/[^\x20-\x7E]/', '?', $text) ?? '';
+        return strlen($clean) > $max ? substr($clean, 0, $max) . '...' : $clean;
+    }
+
+    /** Team id: 1-80 printable ASCII characters without whitespace (pok_teams_tbl.id is varchar(80)), else null. */
+    public static function parseTeamId(string $text): ?string {
+        $team = trim($text);
+        return preg_match('/^[\x21-\x7E]{1,80}$/', $team) === 1 ? $team : null;
     }
 
     /**
      * Returns the team id of a valid "pull:<team_id>" message, otherwise null.
-     * Team ids are at most 80 printable ASCII characters without whitespace (pok_teams_tbl.id is varchar(80)).
      */
     public static function parseNotify(string $data): ?string {
         $data = trim($data);
         if (!str_starts_with($data, 'pull:')) return null;
-        $team = trim(substr($data, 5));
-        if (preg_match('/^[\x21-\x7E]{1,80}$/', $team) !== 1) return null;
-        return $team;
+        return self::parseTeamId(substr($data, 5));
     }
 
     /**
@@ -115,7 +179,7 @@ class MsgServer implements MessageComponentInterface {
             unset($this->user_cons[$conn->resourceId]);
             unset($this->users[$conn->resourceId]);
         }
-        $this->logMsg("An error has occurred: {$e->getMessage()}");
+        $this->logMsg("An error has occurred: " . self::forLog($e->getMessage(), 300));
         $conn->close();
     }
 

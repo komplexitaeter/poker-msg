@@ -68,6 +68,7 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 * Effect: every connection subscribed to that team receives `pull`, exactly like after a `push` from the browser
   (which keeps working). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
   the end of the 100 ms window (so the last change is always loaded).
+  Notifications for teams without subscribers are dropped and only counted (logged at most once per minute).
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
 * Security: bound to 127.0.0.1 only, but **every local process (any user) can send**. The worst a local sender can do
   is trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket

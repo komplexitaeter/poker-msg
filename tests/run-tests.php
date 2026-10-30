@@ -156,6 +156,16 @@ check(MsgServer::parseTeamId(' Team_4b ') === 'Team_4b', 'parseTeamId trims (cli
 check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line breaks and control characters');
 check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
 
+echo "notifications for teams without subscribers\n";
+$srv = new MsgServer();
+ob_start();
+for ($i = 0; $i < 50; $i++) $srv->onNotify("pull:ghost$i");
+$out = (string)ob_get_clean();
+check(substr_count($out, "\n") === 1 && substr_count($out, 'teams without subscribers') === 1,
+    'no log line per notification (1 line for 50 notifications)');
+check(!str_contains($out, 'New notification'), 'no pull logged for teams without subscribers');
+check($srv->notifyStateSize() === 0, 'no state kept for teams without subscribers');
+
 /* ---------- integration: running server ---------- */
 
 echo "server (ws " . WS_PORT . ", udp " . NOTIFY_PORT . ", heartbeat 1s)\n";

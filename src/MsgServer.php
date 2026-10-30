@@ -21,8 +21,11 @@ class MsgServer implements MessageComponentInterface {
     private array $lastNotify = [];
     /** @var array<string, int> team id => notifications merged into the scheduled trailing pull */
     private array $pendingNotify = [];
-    private int $invalidCount = 0;
-    private float $invalidLoggedAt = 0.0;
+    /** @var array<string, int> kind => notifications ignored since the last log line */
+    private array $ignoredCount = [];
+    /** @var array<string, float> kind => time of the last log line */
+    private array $ignoredLoggedAt = [];
+    private float $lastPruneAt = 0.0;
 
     public function __construct() {
         $this->logMsg("Starting up MsgServer");
@@ -89,13 +92,12 @@ class MsgServer implements MessageComponentInterface {
     public function onNotify(string $data): void {
         $team = self::parseNotify($data);
         if ($team === null) {
-            $this->invalidCount++;
-            $now = microtime(true);
-            if ($now - $this->invalidLoggedAt >= self::INVALID_LOG_INTERVAL) {
-                $this->logMsg("Ignored {$this->invalidCount} invalid notification(s), last one " . strlen($data) . " bytes");
-                $this->invalidCount = 0;
-                $this->invalidLoggedAt = $now;
-            }
+            $this->countIgnored('invalid notification(s)', 'last one ' . strlen($data) . ' bytes');
+            return;
+        }
+        // Nobody is watching this team: drop early, no log line per notification, no state.
+        if (!in_array($team, $this->user_subs, true)) {
+            $this->countIgnored('notification(s) for teams without subscribers', "last one for '$team'");
             return;
         }
 
@@ -113,17 +115,40 @@ class MsgServer implements MessageComponentInterface {
         // dropped, because the earlier pull may have been read before this change was written.
         $this->pendingNotify[$team] = 1;
         $this->loop->addTimer(self::NOTIFY_WINDOW - $since, function () use ($team) {
-            $cnt = $this->pendingNotify[$team] ?? 1;
-            unset($this->pendingNotify[$team]);
-            $this->sendNotifyPull($team, $cnt);
+            // An exception in a timer callback would end the process, so catch everything here.
+            try {
+                $cnt = $this->pendingNotify[$team] ?? 1;
+                unset($this->pendingNotify[$team]);
+                $this->sendNotifyPull($team, $cnt);
+            } catch (\Throwable $e) {
+                $this->logMsg('ERROR: ' . self::forLog($e->getMessage(), 300));
+            }
         });
+    }
+
+    /** Counts an ignored notification and logs the count at most once per INVALID_LOG_INTERVAL. */
+    private function countIgnored(string $kind, string $detail): void {
+        $this->ignoredCount[$kind] = ($this->ignoredCount[$kind] ?? 0) + 1;
+        $now = microtime(true);
+        if ($now - ($this->ignoredLoggedAt[$kind] ?? 0.0) >= self::INVALID_LOG_INTERVAL) {
+            $this->logMsg("Ignored {$this->ignoredCount[$kind]} $kind, $detail");
+            $this->ignoredCount[$kind] = 0;
+            $this->ignoredLoggedAt[$kind] = $now;
+        }
+    }
+
+    /** Number of teams in the notification state (for tests). */
+    public function notifyStateSize(): int {
+        return count($this->lastNotify) + count($this->pendingNotify);
     }
 
     private function sendNotifyPull(string $team, int $merged): void {
         $now = microtime(true);
         $this->lastNotify[$team] = $now;
-        if (count($this->lastNotify) > 1000) {   // keep the map small: forget teams outside the window
+        if ($now - $this->lastPruneAt >= 1.0) {   // keep the map small, at most once per second
+            $this->lastPruneAt = $now;
             $this->lastNotify = array_filter($this->lastNotify, fn($t) => $now - $t < self::NOTIFY_WINDOW);
+            $this->lastNotify[$team] = $now;
         }
         $this->logMsg("New notification: pull for team '$team'" . ($merged > 1 ? " ($merged merged)" : ""));
         $this->pullTeam($team);

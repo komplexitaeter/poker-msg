@@ -18,7 +18,7 @@ class MsgServer implements MessageComponentInterface {
     }
 
     public function onOpen(ConnectionInterface $conn) {
-        $this->users[$conn->resourceId] = 1;
+        $this->users[$conn->resourceId] = $conn;
         $this->logMsg("New connection from $conn->resourceId established.");
         $this->logActiveUsers();
     }
@@ -37,16 +37,65 @@ class MsgServer implements MessageComponentInterface {
         } else if (str_contains($msg, 'push')) {
 
             if (isset($this->user_subs[$from->resourceId])) {
-
                 $team = $this->user_subs[$from->resourceId];
                 $this->logMsg(".. received a push notification to all users of team: $team");
+                $this->pullTeam($team);
+            }
+        }
+    }
 
-                foreach ($this->user_cons as $user) {
-                    if (isset($this->user_subs[$user->resourceId]) and $this->user_subs[$user->resourceId] == $team) {
-                        $this->logMsg(".. posting pull request to $user->resourceId");
-                        $user->send("pull");
-                    }
-                }
+    /**
+     * Send "pull" to every connection subscribed to the given team (B-81).
+     * Used by the browser "push" and by the local UDP notification channel.
+     */
+    public function pullTeam(string $team): int {
+        $cnt = 0;
+        foreach ($this->user_cons as $user) {
+            if (isset($this->user_subs[$user->resourceId]) and $this->user_subs[$user->resourceId] == $team) {
+                $this->logMsg(".. posting pull request to $user->resourceId");
+                $user->send("pull");
+                $cnt++;
+            }
+        }
+        return $cnt;
+    }
+
+    /**
+     * Handle a datagram from the local notification channel (B-81).
+     * Format: "pull:<team_id>"; anything else is ignored.
+     */
+    public function onNotify(string $data): void {
+        $team = self::parseNotify($data);
+        if ($team === null) {
+            $this->logMsg("Ignored invalid notification (" . strlen($data) . " bytes)");
+            return;
+        }
+        $this->logMsg("New notification: pull for team '$team'");
+        $this->pullTeam($team);
+    }
+
+    /**
+     * Returns the team id of a valid "pull:<team_id>" message, otherwise null.
+     * Team ids are at most 80 printable ASCII characters without whitespace (pok_teams_tbl.id is varchar(80)).
+     */
+    public static function parseNotify(string $data): ?string {
+        $data = trim($data);
+        if (!str_starts_with($data, 'pull:')) return null;
+        $team = trim(substr($data, 5));
+        if (preg_match('/^[\x21-\x7E]{1,80}$/', $team) !== 1) return null;
+        return $team;
+    }
+
+    /**
+     * Send the text message "hb" to every open connection (B-81), so clients can detect
+     * a silently dead connection. Not logged per connection to keep the info log small.
+     */
+    public function heartbeat(): void {
+        foreach ($this->users as $conn) {
+            try {
+                $conn->send("hb");
+            } catch (\Throwable $e) {
+                $this->logMsg("Heartbeat to {$conn->resourceId} failed: {$e->getMessage()}");
             }
         }
     }
@@ -82,7 +131,7 @@ class MsgServer implements MessageComponentInterface {
         }
         $this->logMsg("active_teams=".count($teams));
     }
-    private function logMsg($msg) {
+    public function logMsg($msg) {
         $date = new DateTime();
         $date = $date->format("Y/m/d H:i:s");
         $delimiter = " ";

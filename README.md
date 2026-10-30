@@ -51,6 +51,51 @@ The server pings every client every 30 seconds and closes connections that did n
 (dead tabs, sleeping laptops, connections dropped by proxies). The interval can be changed with the environment
 variable `POKER_MSG_KEEPALIVE` (seconds), e.g. `environment = POKER_MSG_KEEPALIVE="30"` in the supervisor config.
 
+### Heartbeat (B-81)
+
+Additionally every connection receives the text message `hb` every 30 seconds. Unlike ping/pong it is visible to the
+page's JavaScript, so a client can tell that its connection is still alive. Clients must ignore unknown messages
+(the board only reacts to messages containing `pull`). Interval: `POKER_MSG_HEARTBEAT` (seconds, `0` disables it).
+Heartbeats are not logged.
+
+### Notifications from the web server (B-81)
+
+Besides the WebSocket port the server listens on a local UDP port for notifications from the PHP application:
+
+* Address: `udp://127.0.0.1:8444` (always localhost; port via `POKER_MSG_NOTIFY_PORT`).
+* Format: one datagram `pull:<team_id>`, e.g. `pull:Team_4b`. The team id has at most 80 printable ASCII characters
+  without whitespace; anything else is ignored (and logged as "Ignored invalid notification").
+* Effect: every connection subscribed to that team receives `pull`, exactly like after a `push` from the browser
+  (which keeps working).
+* Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
+* Security: bound to 127.0.0.1 only, so only processes on the same host can send. The worst a local sender can do is
+  trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket server
+  keeps running without this channel.
+
+Sending from PHP:
+
+ ```
+ $sock = @stream_socket_client('udp://127.0.0.1:8444', $errno, $errstr);
+ if ($sock !== false) { @fwrite($sock, 'pull:' . $team_id); fclose($sock); }
+ ```
+
+Test on the server: `printf 'pull:test' | nc -u -w1 127.0.0.1 8444` writes `New notification: pull for team 'test'`
+to the info log; `ss -ulpn | grep 8444` shows the listener.
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POKER_MSG_PORT` | `8443` | WebSocket port (127.0.0.1) |
+| `POKER_MSG_KEEPALIVE` | `30` | ping interval in seconds |
+| `POKER_MSG_HEARTBEAT` | `30` | `hb` interval in seconds, `0` = off |
+| `POKER_MSG_NOTIFY_PORT` | `8444` | UDP notification port (127.0.0.1) |
+
+### Tests
+
+`php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18446 and checks pull
+distribution, UDP notifications, heartbeats and a failing UDP bind. Exit code 0 means all passed.
+
 Here is an example supervisor config:
  ```
  [program:poker-msg]

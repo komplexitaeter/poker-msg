@@ -157,9 +157,8 @@ check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line break
 check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
 
 echo "parseReact (B-110)\n";
-check(array_filter(MsgServer::REACT_CODES, fn($c) => str_contains($c, 'pull')) === [], 'no code contains "pull" (old clients)');
-foreach (MsgServer::REACT_CODES as $code) {
-    check(MsgServer::parseReact("react:12:345:$code") === "react:12:345:$code", "code '$code' accepted");
+foreach (['cake', 'heart', 'clap', 'party', 'think', 'thumbs', 'fish', 'coffee', 'bomb', 'a', 'abcdefghijkl'] as $code) {
+    check(MsgServer::parseReact("react:12:345:$code") === "react:12:345:$code", "any lower-case code '$code' is forwarded");
 }
 check(MsgServer::parseReact("react:1:2:heart\n") === 'react:1:2:heart', 'trailing newline is trimmed');
 check(MsgServer::parseReact('react:1234567890:1:clap') === 'react:1234567890:1:clap', '10 digits accepted');
@@ -168,8 +167,18 @@ check(MsgServer::parseReact('react::1:clap') === null, 'empty from rejected');
 check(MsgServer::parseReact('react:1::clap') === null, 'empty to rejected');
 check(MsgServer::parseReact('react:-1:2:clap') === null, 'sign rejected');
 check(MsgServer::parseReact('react:a1:2:clap') === null, 'non-digit mkey rejected');
-check(MsgServer::parseReact('react:1:2:bomb') === null, 'unknown code rejected');
-check(MsgServer::parseReact('react:1:2:Heart') === null, 'code is case-sensitive');
+check(MsgServer::parseReact('react:1:2:abcdefghijklm') === null, 'code longer than 12 letters rejected');
+check(MsgServer::parseReact('react:1:2:pull') === null, 'code "pull" rejected (old clients)');
+check(MsgServer::parseReact('react:1:2:xpullx') === null, 'code containing "pull" rejected (old clients)');
+check(MsgServer::parseReact('react:1:2:heart2') === null, 'digit in code rejected');
+check(MsgServer::parseReact('react:1:2:thumbs_up') === null, 'underscore in code rejected');
+check(MsgServer::parseReact('react:1:2:th-umb') === null, 'hyphen in code rejected');
+check(MsgServer::parseReact("react:1:2:caf\u{e9}") === null, 'non-ASCII letter in code rejected');
+check(MsgServer::parseReact('react:0:345:nudge') === 'react:0:345:nudge', 'from 0 accepted (anonymous nudge)');
+check(MsgServer::parseReact('react:12:345:nudge') === 'react:12:345:nudge', 'from is forwarded unchanged (no meaning attached)');
+check(MsgServer::parseReact('react:0:345:heart') === 'react:0:345:heart', 'from 0 accepted for other codes');
+check(MsgServer::parseReact('react:12:0:fish') === 'react:12:0:fish', 'to 0 accepted');
+check(MsgServer::parseReact('react:1:2:Heart') === null, 'upper-case letter in code rejected');
 check(MsgServer::parseReact('react:1:2:heart:x') === null, 'extra field rejected');
 check(MsgServer::parseReact('react:1:2') === null, 'missing code rejected');
 check(MsgServer::parseReact("react:1:2:heart\nFAKE") === null, 'line break inside rejected');
@@ -262,13 +271,14 @@ try {
     $a1->receive(0.05);
 
     // invalid reactions and unsubscribed senders are dropped (a2 has not reacted yet, so no rate limit)
-    $a2->send('react:1:2:bomb');
+    $a2->send('react:1:2:Bomb');
+    $a2->send('react:1:2:pull');
     $a2->send('react:1:2:heart:x');
     $a2->send('react:12345678901:2:heart');
     $a2->send("react:1:2:heart\nFAKE LOG LINE");
     check($isReact($a1->receive(0.4)) === [], 'invalid reactions are dropped');
-    $a2->send('react:3:4:coffee');
-    check($isReact($a1->receive(0.4)) === ['react:3:4:coffee'], 'invalid reactions do not count for the rate limit');
+    $a2->send('react:3:4:bomb');
+    check($isReact($a1->receive(0.4)) === ['react:3:4:bomb'], 'invalid reactions do not count for the rate limit (unknown code forwarded)');
     $a2->receive(0.05);
     $anon = new WsClient(WS_PORT);
     $anon->send('react:1:2:think');

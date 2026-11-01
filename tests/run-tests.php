@@ -157,6 +157,7 @@ check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line break
 check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
 
 echo "parseReact (B-110)\n";
+check(array_filter(MsgServer::REACT_CODES, fn($c) => str_contains($c, 'pull')) === [], 'no code contains "pull" (old clients)');
 foreach (MsgServer::REACT_CODES as $code) {
     check(MsgServer::parseReact("react:12:345:$code") === "react:12:345:$code", "code '$code' accepted");
 }
@@ -298,6 +299,7 @@ try {
     check(substr_count($logText, 'invalid notification(s)') === 1, 'invalid datagrams logged once per minute');
     check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
     check(substr_count($logText, 'forwarded reaction') === 4, 'forwarded reactions logged');
+    check(!str_contains($logText, 'react:'), 'reaction content is not logged');
     check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');
     check(!str_contains($logText, 'WARNING: PHP extension sockets missing') || !function_exists('socket_create'), 'no fallback warning when sockets is available');
 } finally {

@@ -28,6 +28,7 @@ class MsgServer implements MessageComponentInterface {
     private float $lastPruneAt = 0.0;
 
     // B-110: reaction codes the board may send ("react:<from-mkey>:<to-mkey>:<code>")
+    // No code may contain "pull": older boards reload on any message that includes('pull').
     public const REACT_CODES = ['cake', 'heart', 'clap', 'party', 'coffee', 'think', 'nudge'];
     // B-110: at most one reaction per connection within this interval (seconds); more are dropped
     public const REACT_INTERVAL = 1.0;
@@ -54,7 +55,10 @@ class MsgServer implements MessageComponentInterface {
 
     public function onMessage(ConnectionInterface $from, $msg) {
         $msg = trim((string)$msg);
-        $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
+        // Reactions (B-110) are logged by onReact() without their content.
+        if (!str_starts_with($msg, 'react:')) {
+            $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
+        }
         // The client sends exactly "subscribe: <team_id>", "push" (script.js) and "react:..." (B-110).
         if (str_starts_with($msg, 'subscribe:')) {
             $team = self::parseTeamId(substr($msg, strlen('subscribe:')));

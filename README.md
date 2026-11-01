@@ -96,18 +96,18 @@ sender and receiver (the boards); poker-msg knows no meanings and no data.
 Reactions are sent directly over the WebSocket; nothing is stored, there is no PHP endpoint and no statistics.
 
 * Browser → server: `react:<from-mkey>:<to-mkey>:<code>`, e.g. `react:12:345:heart`. The connection must be
-  subscribed (`subscribe:<team_id>`) before. Anonymous nudge: `react:0:<to-mkey>:nudge`.
+  subscribed (`subscribe:<team_id>`) before. The board sends `0` as `from` itself
+  where it wants no sender (e.g. the anonymous nudge `react:0:<to-mkey>:nudge`).
 * Server → browser: the same text `react:<from-mkey>:<to-mkey>:<code>`, sent at once (not merged) to **every**
   connection subscribed to the sender's team, **including the sender** (the board animates on this echo only).
 * Validation: `from`/`to` 1-10 digits (`mkey`, `0` allowed), `code` 1-12 lower-case ASCII letters `a-z` that do not
   contain `pull` (older boards reload on any message containing `pull`), nothing else in the message. poker-msg does
   not know the codes: which codes exist and how they look is decided by the board alone (it ignores unknown codes),
-  so new emojis need no poker-msg deployment.
-* `nudge` is anonymous: the server always forwards it with `from` = `0`, whatever the client sent. Invalid messages and messages from unsubscribed connections are
+  so new emojis need no poker-msg deployment. Invalid messages and messages from unsubscribed connections are
   dropped silently (short info log line without the message content).
 * Rate limit: at most one reaction per connection and second; further reactions within that second are dropped.
 * `from` is not verified (any team member could send in someone else's name); acceptable for a fun feature.
-  For `nudge` it is replaced by `0` anyway.
+  poker-msg forwards `from` as it comes; it attaches no meaning to it.
 
 ### Environment variables
 

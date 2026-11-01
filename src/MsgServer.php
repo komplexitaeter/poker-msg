@@ -31,8 +31,6 @@ class MsgServer implements MessageComponentInterface {
     // (REACT_CODE_PATTERN); which codes exist is decided by the board alone (it ignores unknown codes).
     // No code may contain "pull": older boards reload on any message that includes('pull').
     public const REACT_CODE_PATTERN = '[a-z]{1,12}';
-    // B-110: anonymous codes; the server always forwards them with from-mkey "0" (no sender, even from a modified client)
-    public const REACT_ANONYMOUS_CODES = ['nudge'];
     // B-110: at most one reaction per connection within this interval (seconds); more are dropped
     public const REACT_INTERVAL = 1.0;
     /** @var array<int, float> resource id => time of the last forwarded reaction */
@@ -121,13 +119,11 @@ class MsgServer implements MessageComponentInterface {
     /**
      * Returns the normalized message of a valid reaction "react:<from-mkey>:<to-mkey>:<code>", otherwise null.
      * mkeys: 1-10 digits ("0" allowed); code: 1-12 lower-case letters a-z (ASCII), must not contain "pull".
-     * For REACT_ANONYMOUS_CODES the from-mkey is always replaced by "0".
      */
     public static function parseReact(string $msg): ?string {
         if (preg_match('/^react:([0-9]{1,10}):([0-9]{1,10}):(' . self::REACT_CODE_PATTERN . ')$/D', trim($msg), $m) !== 1) return null;
         if (str_contains($m[3], 'pull')) return null;
-        $from = in_array($m[3], self::REACT_ANONYMOUS_CODES, true) ? '0' : $m[1];
-        return "react:{$from}:{$m[2]}:{$m[3]}";
+        return "react:{$m[1]}:{$m[2]}:{$m[3]}";
     }
 
     /**

@@ -174,8 +174,8 @@ check(MsgServer::parseReact('react:1:2:heart2') === null, 'digit in code rejecte
 check(MsgServer::parseReact('react:1:2:thumbs_up') === null, 'underscore in code rejected');
 check(MsgServer::parseReact('react:1:2:th-umb') === null, 'hyphen in code rejected');
 check(MsgServer::parseReact("react:1:2:caf\u{e9}") === null, 'non-ASCII letter in code rejected');
-check(MsgServer::parseReact('react:0:345:nudge') === 'react:0:345:nudge', 'anonymous nudge (from 0) accepted');
-check(MsgServer::parseReact('react:12:345:nudge') === 'react:0:345:nudge', 'nudge sender normalized to 0');
+check(MsgServer::parseReact('react:0:345:nudge') === 'react:0:345:nudge', 'from 0 accepted (anonymous nudge)');
+check(MsgServer::parseReact('react:12:345:nudge') === 'react:12:345:nudge', 'from is forwarded unchanged (no meaning attached)');
 check(MsgServer::parseReact('react:0:345:heart') === 'react:0:345:heart', 'from 0 accepted for other codes');
 check(MsgServer::parseReact('react:12:0:fish') === 'react:12:0:fish', 'to 0 accepted');
 check(MsgServer::parseReact('react:1:2:Heart') === null, 'upper-case letter in code rejected');
@@ -267,7 +267,7 @@ try {
     check($isReact($b1->receive(0.4)) === ['react:5:6:party'], 'rate limit is per connection');
     usleep(700000);
     $a1->send('react:11:22:nudge');
-    check($isReact($a2->receive(0.4)) === ['react:0:22:nudge'], 'reaction accepted again after 1 s (nudge sent anonymously)');
+    check($isReact($a2->receive(0.4)) === ['react:11:22:nudge'], 'reaction accepted again after 1 s');
     $a1->receive(0.05);
 
     // invalid reactions and unsubscribed senders are dropped (a2 has not reacted yet, so no rate limit)

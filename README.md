@@ -89,6 +89,10 @@ to the info log; `ss -ulpn | grep 8444` shows the listener.
 
 ### Reactions (B-110)
 
+Principle: poker-msg is only the channel. It guarantees the format of a message (sender, recipient, form of the
+code), delivery only within the sender's own team, and the rate limit. What a message means is settled between
+sender and receiver (the boards); poker-msg knows no meanings and no data.
+
 Reactions are sent directly over the WebSocket; nothing is stored, there is no PHP endpoint and no statistics.
 
 * Browser → server: `react:<from-mkey>:<to-mkey>:<code>`, e.g. `react:12:345:heart`. The connection must be

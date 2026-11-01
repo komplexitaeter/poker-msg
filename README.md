@@ -87,6 +87,20 @@ Sending from PHP:
 Test on the server: `printf 'pull:test' | nc -u -w1 127.0.0.1 8444` writes `New notification: pull for team 'test'`
 to the info log; `ss -ulpn | grep 8444` shows the listener.
 
+### Reactions (B-110)
+
+Reactions are sent directly over the WebSocket; nothing is stored, there is no PHP endpoint and no statistics.
+
+* Browser → server: `react:<from-mkey>:<to-mkey>:<code>`, e.g. `react:12:345:heart`. The connection must be
+  subscribed (`subscribe:<team_id>`) before.
+* Server → browser: the same text `react:<from-mkey>:<to-mkey>:<code>`, sent at once (not merged) to **every**
+  connection subscribed to the sender's team, **including the sender** (the board animates on this echo only).
+* Validation: `from`/`to` 1-10 digits (`mkey`), `code` one of `cake`, `heart`, `clap`, `party`, `coffee`, `think`,
+  `nudge` (lower case), nothing else in the message. Invalid messages and messages from unsubscribed connections are
+  dropped silently (short info log line without the message content).
+* Rate limit: at most one reaction per connection and second; further reactions within that second are dropped.
+* `from` is not verified (any team member could send in someone else's name); acceptable for a fun feature.
+
 ### Environment variables
 
 | Variable | Default | Meaning |
@@ -99,7 +113,7 @@ to the info log; `ss -ulpn | grep 8444` shows the listener.
 ### Tests
 
 `php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18446 and checks pull
-distribution, UDP notifications, heartbeats and a failing UDP bind. Exit code 0 means all passed.
+distribution, UDP notifications, reactions, heartbeats and a failing UDP bind. Exit code 0 means all passed.
 
 Here is an example supervisor config:
  ```

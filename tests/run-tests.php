@@ -2,7 +2,7 @@
 /*
  * Integration tests for poker-msg (B-81): starts bin/msg-server.php on test ports,
  * connects minimal WebSocket clients and checks pull distribution, UDP notifications,
- * the "hb" heartbeat and that a failing UDP bind does not stop the server.
+ * reactions (B-110), the "hb" heartbeat and that a failing UDP bind does not stop the server.
  *
  * Usage: php tests/run-tests.php   (needs vendor/, ports 18443/18444 and 18445/18446 free)
  * Exit code 0 = all passed.
@@ -156,6 +156,24 @@ check(MsgServer::parseTeamId(' Team_4b ') === 'Team_4b', 'parseTeamId trims (cli
 check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line breaks and control characters');
 check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
 
+echo "parseReact (B-110)\n";
+foreach (MsgServer::REACT_CODES as $code) {
+    check(MsgServer::parseReact("react:12:345:$code") === "react:12:345:$code", "code '$code' accepted");
+}
+check(MsgServer::parseReact("react:1:2:heart\n") === 'react:1:2:heart', 'trailing newline is trimmed');
+check(MsgServer::parseReact('react:1234567890:1:clap') === 'react:1234567890:1:clap', '10 digits accepted');
+check(MsgServer::parseReact('react:12345678901:1:clap') === null, '11 digits rejected');
+check(MsgServer::parseReact('react::1:clap') === null, 'empty from rejected');
+check(MsgServer::parseReact('react:1::clap') === null, 'empty to rejected');
+check(MsgServer::parseReact('react:-1:2:clap') === null, 'sign rejected');
+check(MsgServer::parseReact('react:a1:2:clap') === null, 'non-digit mkey rejected');
+check(MsgServer::parseReact('react:1:2:bomb') === null, 'unknown code rejected');
+check(MsgServer::parseReact('react:1:2:Heart') === null, 'code is case-sensitive');
+check(MsgServer::parseReact('react:1:2:heart:x') === null, 'extra field rejected');
+check(MsgServer::parseReact('react:1:2') === null, 'missing code rejected');
+check(MsgServer::parseReact("react:1:2:heart\nFAKE") === null, 'line break inside rejected');
+check(MsgServer::parseReact('react: 1:2:heart') === null, 'whitespace inside rejected');
+
 echo "notifications for teams without subscribers\n";
 $srv = new MsgServer();
 ob_start();
@@ -222,6 +240,40 @@ try {
     check(in_array('pull', $nospace->receive(0.4), true), 'subscribe without space still works');
     $nospace->close();
 
+    // B-110: reactions go to every connection of the team (incl. sender), not to other teams
+    $isReact = fn(array $msgs) => array_values(array_filter($msgs, fn($m) => str_starts_with($m, 'react:')));
+    foreach ([$a1, $a2, $b1] as $c) $c->receive(0.05);
+    $a1->send('react:11:22:cake');
+    $ra1 = $isReact($a1->receive(0.4)); $ra2 = $isReact($a2->receive(0.1)); $rb1 = $isReact($b1->receive(0.1));
+    check($ra1 === ['react:11:22:cake'], 'reaction echoed to the sender');
+    check($ra2 === ['react:11:22:cake'], 'reaction forwarded to the team');
+    check($rb1 === [], 'reaction not forwarded to other teams');
+
+    // rate limit: further reactions within 1 s are dropped, afterwards accepted again
+    $a1->send('react:11:22:heart');
+    $a1->send('react:11:22:clap');
+    check($isReact($a2->receive(0.4)) === [], 'reactions within 1 s are dropped');
+    $b1->send('react:5:6:party');
+    check($isReact($b1->receive(0.4)) === ['react:5:6:party'], 'rate limit is per connection');
+    usleep(700000);
+    $a1->send('react:11:22:nudge');
+    check($isReact($a2->receive(0.4)) === ['react:11:22:nudge'], 'reaction accepted again after 1 s');
+    $a1->receive(0.05);
+
+    // invalid reactions and unsubscribed senders are dropped (a2 has not reacted yet, so no rate limit)
+    $a2->send('react:1:2:bomb');
+    $a2->send('react:1:2:heart:x');
+    $a2->send('react:12345678901:2:heart');
+    $a2->send("react:1:2:heart\nFAKE LOG LINE");
+    check($isReact($a1->receive(0.4)) === [], 'invalid reactions are dropped');
+    $a2->send('react:3:4:coffee');
+    check($isReact($a1->receive(0.4)) === ['react:3:4:coffee'], 'invalid reactions do not count for the rate limit');
+    $a2->receive(0.05);
+    $anon = new WsClient(WS_PORT);
+    $anon->send('react:1:2:think');
+    check($isReact($anon->receive(0.3)) === [] && $isReact($a1->receive(0.1)) === [], 'reaction from unsubscribed connection is dropped');
+    $anon->close();
+
     udp(NOTIFY_PORT, 'garbage');
     udp(NOTIFY_PORT, 'pull:' . str_repeat('x', 300));
     udp(NOTIFY_PORT, "pull:\x00\xff");
@@ -245,6 +297,7 @@ try {
     check(str_contains($logText, "Notify channel listening on udp://127.0.0.1:" . NOTIFY_PORT), 'notify channel logged at start');
     check(substr_count($logText, 'invalid notification(s)') === 1, 'invalid datagrams logged once per minute');
     check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
+    check(substr_count($logText, 'forwarded reaction') === 4, 'forwarded reactions logged');
     check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');
     check(!str_contains($logText, 'WARNING: PHP extension sockets missing') || !function_exists('socket_create'), 'no fallback warning when sockets is available');
 } finally {

@@ -27,6 +27,15 @@ class MsgServer implements MessageComponentInterface {
     private array $ignoredLoggedAt = [];
     private float $lastPruneAt = 0.0;
 
+    // B-110: reactions "react:<from-mkey>:<to-mkey>:<code>". The server checks only the format of the code
+    // (REACT_CODE_PATTERN); which codes exist is decided by the board alone (it ignores unknown codes).
+    // No code may contain "pull": older boards reload on any message that includes('pull').
+    public const REACT_CODE_PATTERN = '[a-z]{1,12}';
+    // B-110: at most one reaction per connection within this interval (seconds); more are dropped
+    public const REACT_INTERVAL = 1.0;
+    /** @var array<int, float> resource id => time of the last forwarded reaction */
+    private array $lastReact = [];
+
     public function __construct() {
         $this->logMsg("Starting up MsgServer");
         $this->users = Array();
@@ -47,8 +56,11 @@ class MsgServer implements MessageComponentInterface {
 
     public function onMessage(ConnectionInterface $from, $msg) {
         $msg = trim((string)$msg);
-        $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
-        // The client sends exactly "subscribe: <team_id>" and "push" (script.js).
+        // Reactions (B-110) are logged by onReact() without their content.
+        if (!str_starts_with($msg, 'react:')) {
+            $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
+        }
+        // The client sends exactly "subscribe: <team_id>", "push" (script.js) and "react:..." (B-110).
         if (str_starts_with($msg, 'subscribe:')) {
             $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
             if ($team === null) {
@@ -66,7 +78,52 @@ class MsgServer implements MessageComponentInterface {
                 $this->logMsg(".. received a push notification to all users of team: $team");
                 $this->pullTeam($team);
             }
+        } else if (str_starts_with($msg, 'react:')) {
+            $this->onReact($from, $msg);
         }
+    }
+
+    /**
+     * Forward a reaction (B-110) unchanged to every connection of the sender's team, including the
+     * sender (it animates on the echo). No state besides the per-connection rate limit, nothing stored.
+     * Invalid reactions, reactions from unsubscribed connections and reactions above the limit are dropped.
+     */
+    private function onReact(ConnectionInterface $from, string $msg): void {
+        $id = $from->resourceId;
+        if (!isset($this->user_subs[$id])) {
+            $this->logMsg(".. ignored reaction from unsubscribed connection $id");
+            return;
+        }
+        $react = self::parseReact($msg);
+        if ($react === null) {
+            $this->logMsg(".. ignored invalid reaction from $id");
+            return;
+        }
+        $now = microtime(true);
+        if ($now - ($this->lastReact[$id] ?? 0.0) < self::REACT_INTERVAL) {
+            $this->logMsg(".. ignored reaction from $id (rate limit)");
+            return;
+        }
+        $this->lastReact[$id] = $now;
+        $team = $this->user_subs[$id];
+        $cnt = 0;
+        foreach ($this->user_cons as $user) {
+            if (($this->user_subs[$user->resourceId] ?? null) === $team) {
+                $user->send($react);
+                $cnt++;
+            }
+        }
+        $this->logMsg(".. forwarded reaction to $cnt connection(s) of team '$team'");
+    }
+
+    /**
+     * Returns the normalized message of a valid reaction "react:<from-mkey>:<to-mkey>:<code>", otherwise null.
+     * mkeys: 1-10 digits ("0" allowed); code: 1-12 lower-case letters a-z (ASCII), must not contain "pull".
+     */
+    public static function parseReact(string $msg): ?string {
+        if (preg_match('/^react:([0-9]{1,10}):([0-9]{1,10}):(' . self::REACT_CODE_PATTERN . ')$/D', trim($msg), $m) !== 1) return null;
+        if (str_contains($m[3], 'pull')) return null;
+        return "react:{$m[1]}:{$m[2]}:{$m[3]}";
     }
 
     /**
@@ -190,6 +247,7 @@ class MsgServer implements MessageComponentInterface {
     }
 
     public function onClose(ConnectionInterface $conn) {
+        unset($this->lastReact[$conn->resourceId]);
         unset($this->user_subs[$conn->resourceId]);
         unset($this->user_cons[$conn->resourceId]);
         unset($this->users[$conn->resourceId]);
@@ -200,6 +258,7 @@ class MsgServer implements MessageComponentInterface {
 
     public function onError(ConnectionInterface $conn, Exception $e) {
         if (isset($conn->resourceId)) {
+            unset($this->lastReact[$conn->resourceId]);
             unset($this->user_subs[$conn->resourceId]);
             unset($this->user_cons[$conn->resourceId]);
             unset($this->users[$conn->resourceId]);

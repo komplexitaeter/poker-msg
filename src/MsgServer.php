@@ -31,9 +31,10 @@ class MsgServer implements MessageComponentInterface {
     // (REACT_CODE_PATTERN); which codes exist is decided by the board alone (it ignores unknown codes).
     // No code may contain "pull": older boards reload on any message that includes('pull').
     public const REACT_CODE_PATTERN = '[a-z]{1,12}';
-    // B-110: at most one reaction per connection within this interval (seconds); more are dropped
-    public const REACT_INTERVAL = 1.0;
-    /** @var array<int, float> resource id => time of the last forwarded reaction */
+    // B-131: staggered rate limit per connection (sliding windows): window in seconds => max forwarded
+    // reactions within that window. Reactions above any limit are dropped.
+    public const REACT_LIMITS = [1 => 1, 60 => 10];
+    /** @var array<int, list<float>> resource id => times of the last forwarded reactions (oldest first) */
     private array $lastReact = [];
 
     public function __construct() {
@@ -56,7 +57,7 @@ class MsgServer implements MessageComponentInterface {
 
     public function onMessage(ConnectionInterface $from, $msg) {
         $msg = trim((string)$msg);
-        // Reactions (B-110) are logged by onReact() without their content.
+        // Reactions (B-110) are logged by onReact() with their validated code only (B-131), never the mkeys.
         if (!str_starts_with($msg, 'react:')) {
             $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
         }
@@ -99,12 +100,18 @@ class MsgServer implements MessageComponentInterface {
             $this->logMsg(".. ignored invalid reaction from $id");
             return;
         }
+        // B-131: only the validated code (REACT_CODE_PATTERN) is logged, never the mkeys
+        $code = substr($react, strrpos($react, ':') + 1);
         $now = microtime(true);
-        if ($now - ($this->lastReact[$id] ?? 0.0) < self::REACT_INTERVAL) {
-            $this->logMsg(".. ignored reaction from $id (rate limit)");
+        $times = self::pruneReactTimes($this->lastReact[$id] ?? [], $now);
+        $hit = self::reactLimitHit($times, $now);
+        if ($hit !== null) {
+            $this->lastReact[$id] = $times;
+            $this->logMsg(".. ignored reaction '$code' from $id (rate limit $hit)");
             return;
         }
-        $this->lastReact[$id] = $now;
+        $times[] = $now;
+        $this->lastReact[$id] = $times;
         $team = $this->user_subs[$id];
         $cnt = 0;
         foreach ($this->user_cons as $user) {
@@ -113,7 +120,36 @@ class MsgServer implements MessageComponentInterface {
                 $cnt++;
             }
         }
-        $this->logMsg(".. forwarded reaction to $cnt connection(s) of team '$team'");
+        $this->logMsg(".. forwarded reaction '$code' to $cnt connection(s) of team '$team'");
+    }
+
+    /**
+     * B-131: returns the label of the first exceeded window (e.g. "1s", "1m") if one more reaction
+     * at $now would exceed a limit of REACT_LIMITS, otherwise null. $times: forwarded reactions, oldest first.
+     */
+    public static function reactLimitHit(array $times, float $now, array $limits = self::REACT_LIMITS): ?string {
+        foreach ($limits as $window => $max) {
+            $cnt = 0;
+            foreach ($times as $t) {
+                if ($now - $t < $window) $cnt++;
+            }
+            if ($cnt >= $max) {
+                return $window % 60 === 0 ? ($window / 60) . 'm' : $window . 's';
+            }
+        }
+        return null;
+    }
+
+    /**
+     * B-131: keeps only the reaction times still relevant for REACT_LIMITS (inside the largest window and at
+     * most as many as its maximum), so the state per connection stays small (at most 10 floats).
+     * @return list<float>
+     */
+    public static function pruneReactTimes(array $times, float $now, array $limits = self::REACT_LIMITS): array {
+        $window = (int)max(array_keys($limits));
+        $max = (int)max($limits);
+        $times = array_values(array_filter($times, fn($t) => $now - $t < $window));
+        return count($times) > $max ? array_slice($times, -$max) : $times;
     }
 
     /**

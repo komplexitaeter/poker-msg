@@ -184,6 +184,36 @@ check(MsgServer::parseReact('react:1:2') === null, 'missing code rejected');
 check(MsgServer::parseReact("react:1:2:heart\nFAKE") === null, 'line break inside rejected');
 check(MsgServer::parseReact('react: 1:2:heart') === null, 'whitespace inside rejected');
 
+echo "reaction rate limit (B-131)\n";
+// Simulates a sender trying a reaction every $step seconds for $duration seconds; returns forwarded count and drop labels.
+$simulate = function (float $step, float $duration, float $start = 0.0, array $times = []): array {
+    $ok = 0; $hits = [];
+    for ($now = $start; $now < $start + $duration - 1e-9; $now += $step) {
+        $times = MsgServer::pruneReactTimes($times, $now);
+        $hit = MsgServer::reactLimitHit($times, $now);
+        if ($hit === null) { $times[] = $now; $ok++; } else { $hits[$hit] = true; }
+    }
+    return [$ok, array_keys($hits), $times];
+};
+check(MsgServer::REACT_LIMITS === [1 => 1, 60 => 10], 'limits 1/s and 10/min');
+check(MsgServer::reactLimitHit([], 0.0) === null, 'first reaction is allowed');
+check(MsgServer::reactLimitHit([10.0], 10.5) === '1s', 'second reaction within 1 s is dropped (1s)');
+check(MsgServer::reactLimitHit([10.0], 11.0) === null, 'reaction after exactly 1 s is allowed');
+[$ok, $hits] = $simulate(0.1, 1.0);
+check($ok === 1 && $hits === ['1s'], "10 tries in 1 s: 1 forwarded (got $ok)");
+[$ok, $hits] = $simulate(1.0, 60.0);
+check($ok === 10 && $hits === ['1m'], "1 try per second for 1 min: 10 forwarded (got $ok)");
+[$ok] = $simulate(1.0, 61.0);
+check($ok === 11, "minute window slides: 11th reaction after 60 s (got $ok)");
+[$ok] = $simulate(1.0, 900.0);
+check($ok === 150, "1 try per second for 15 min: 150 forwarded (10 per minute, no longer windows, got $ok)");
+[$ok] = $simulate(6.0, 600.0);
+check($ok === 100, "one try every 6 s for 10 min is never dropped (got $ok)");
+[$ok, $hits, $times] = $simulate(0.25, 3600.0);
+check(count($times) <= 10, 'state per connection stays at most 10 times (got ' . count($times) . ')');
+check(MsgServer::pruneReactTimes([1.0, 2.0], 100.0) === [], 'times older than 1 min are pruned');
+check(MsgServer::reactLimitHit([0.0, 1.0], 2.0, [1 => 1, 60 => 2]) === '1m', 'limits are configurable (array window => max)');
+
 echo "notifications for teams without subscribers\n";
 $srv = new MsgServer();
 ob_start();
@@ -310,6 +340,10 @@ try {
     check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
     check(substr_count($logText, 'forwarded reaction') === 4, 'forwarded reactions logged');
     check(!str_contains($logText, 'react:'), 'reaction content is not logged');
+    check(str_contains($logText, ".. ignored reaction 'heart' from ") && str_contains($logText, ".. ignored reaction 'clap' from ")
+        && preg_match("/ignored reaction 'heart' from \\d+ \\(rate limit 1s\\)$/m", $logText) === 1, 'dropped reactions logged with code and window (B-131)');
+    check(str_contains($logText, ".. forwarded reaction 'cake' to 2 connection(s) of team 'teamA'"), 'forwarded reactions logged with code (B-131)');
+    check(!str_contains($logText, '11:22') && !str_contains($logText, '5:6'), 'mkeys of reactions are not logged');
     check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');
     check(!str_contains($logText, 'WARNING: PHP extension sockets missing') || !function_exists('socket_create'), 'no fallback warning when sockets is available');
 } finally {

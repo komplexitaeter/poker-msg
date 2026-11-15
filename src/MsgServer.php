@@ -33,7 +33,7 @@ class MsgServer implements MessageComponentInterface {
     public const REACT_CODE_PATTERN = '[a-z]{1,12}';
     // B-131: staggered rate limit per connection (sliding windows): window in seconds => max forwarded
     // reactions within that window. Reactions above any limit are dropped.
-    public const REACT_LIMITS = [1 => 1, 60 => 10];
+    public const REACT_LIMITS = [1 => 3, 60 => 10];
     /** @var array<int, list<float>> resource id => times of the last forwarded reactions (oldest first) */
     private array $lastReact = [];
 

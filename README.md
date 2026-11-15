@@ -105,7 +105,7 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
   not know the codes: which codes exist and how they look is decided by the board alone (it ignores unknown codes),
   so new emojis need no poker-msg deployment. Invalid messages and messages from unsubscribed connections are
   dropped silently (short info log line without the message content).
-* Rate limit (B-131): per connection, sliding windows over the forwarded reactions: at most **1 per second and 10 per
+* Rate limit (B-131): per connection, sliding windows over the forwarded reactions: at most **3 per second and 10 per
   minute** (`MsgServer::REACT_LIMITS`, window in seconds => max). Reactions
   above a limit are dropped with a log line naming the window. There is no limit per team.
 * Log (B-131): only the validated code is logged, never `from`/`to` or anything else, e.g.

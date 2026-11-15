@@ -195,12 +195,17 @@ $simulate = function (float $step, float $duration, float $start = 0.0, array $t
     }
     return [$ok, array_keys($hits), $times];
 };
-check(MsgServer::REACT_LIMITS === [1 => 1, 60 => 10], 'limits 1/s and 10/min');
+check(MsgServer::REACT_LIMITS === [1 => 3, 60 => 10], 'limits 3/s and 10/min');
 check(MsgServer::reactLimitHit([], 0.0) === null, 'first reaction is allowed');
-check(MsgServer::reactLimitHit([10.0], 10.5) === '1s', 'second reaction within 1 s is dropped (1s)');
-check(MsgServer::reactLimitHit([10.0], 11.0) === null, 'reaction after exactly 1 s is allowed');
+check(MsgServer::reactLimitHit([10.0, 10.2], 10.5) === null, 'third reaction within 1 s is allowed');
+check(MsgServer::reactLimitHit([10.0, 10.2, 10.4], 10.5) === '1s', 'fourth reaction within 1 s is dropped (1s)');
+check(MsgServer::reactLimitHit([10.0, 10.2, 10.4], 11.0) === null, 'reaction after exactly 1 s is allowed');
 [$ok, $hits] = $simulate(0.1, 1.0);
-check($ok === 1 && $hits === ['1s'], "10 tries in 1 s: 1 forwarded (got $ok)");
+check($ok === 3 && $hits === ['1s'], "10 tries in 1 s: 3 forwarded (got $ok)");
+[$ok, $hits] = $simulate(0.1, 60.0);
+check($ok === 10 && $hits === ['1s', '1m'], "10 tries per second for 1 min: 10 forwarded, the 11th dropped (got $ok)");
+[$ok, $hits] = $simulate(0.4, 60.0);
+check($ok === 10 && $hits === ['1m'], "a try every 0.4 s (below 3/s) for 1 min: 10 forwarded (got $ok)");
 [$ok, $hits] = $simulate(1.0, 60.0);
 check($ok === 10 && $hits === ['1m'], "1 try per second for 1 min: 10 forwarded (got $ok)");
 [$ok] = $simulate(1.0, 61.0);
@@ -289,10 +294,11 @@ try {
     check($ra2 === ['react:11:22:cake'], 'reaction forwarded to the team');
     check($rb1 === [], 'reaction not forwarded to other teams');
 
-    // rate limit: further reactions within 1 s are dropped, afterwards accepted again
+    // rate limit: 3 per second (cake + heart + clap), the 4th within 1 s is dropped, afterwards accepted again
     $a1->send('react:11:22:heart');
     $a1->send('react:11:22:clap');
-    check($isReact($a2->receive(0.4)) === [], 'reactions within 1 s are dropped');
+    $a1->send('react:11:22:wave');
+    check($isReact($a2->receive(0.4)) === ['react:11:22:heart', 'react:11:22:clap'], 'the 4th reaction within 1 s is dropped');
     $b1->send('react:5:6:party');
     check($isReact($b1->receive(0.4)) === ['react:5:6:party'], 'rate limit is per connection');
     usleep(700000);
@@ -338,10 +344,10 @@ try {
     check(str_contains($logText, "Notify channel listening on udp://127.0.0.1:" . NOTIFY_PORT), 'notify channel logged at start');
     check(substr_count($logText, 'invalid notification(s)') === 1, 'invalid datagrams logged once per minute');
     check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
-    check(substr_count($logText, 'forwarded reaction') === 4, 'forwarded reactions logged');
+    check(substr_count($logText, 'forwarded reaction') === 6, 'forwarded reactions logged');
     check(!str_contains($logText, 'react:'), 'reaction content is not logged');
-    check(str_contains($logText, ".. ignored reaction 'heart' from ") && str_contains($logText, ".. ignored reaction 'clap' from ")
-        && preg_match("/ignored reaction 'heart' from \\d+ \\(rate limit 1s\\)$/m", $logText) === 1, 'dropped reactions logged with code and window (B-131)');
+    check(str_contains($logText, ".. ignored reaction 'wave' from ") && !str_contains($logText, ".. ignored reaction 'clap' from ")
+        && preg_match("/ignored reaction 'wave' from \\d+ \\(rate limit 1s\\)$/m", $logText) === 1, 'dropped reactions logged with code and window (B-131)');
     check(str_contains($logText, ".. forwarded reaction 'cake' to 2 connection(s) of team 'teamA'"), 'forwarded reactions logged with code (B-131)');
     check(!str_contains($logText, '11:22') && !str_contains($logText, '5:6'), 'mkeys of reactions are not logged');
     check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');

@@ -65,8 +65,8 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 * Address: `udp://127.0.0.1:8444` (always localhost; port via `POKER_MSG_NOTIFY_PORT`).
 * Format: one datagram `pull:<team_id>`, e.g. `pull:Team_4b`. The team id has at most 80 printable ASCII characters
   without whitespace; anything else is ignored. Invalid datagrams are logged at most once per minute (with a count).
-* Effect: every connection subscribed to that team receives `pull`, exactly like after a `push` from the browser
-  (which keeps working). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
+* Effect: every connection subscribed to that team receives `pull`, the only way to trigger a `pull`
+  (B-93: the former browser message `push` is ignored like any unknown message). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
   the end of the 100 ms window (so the last change is always loaded).
   Notifications for teams without subscribers are dropped and only counted (logged at most once per minute).
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.

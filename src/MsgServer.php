@@ -61,7 +61,9 @@ class MsgServer implements MessageComponentInterface {
         if (!str_starts_with($msg, 'react:')) {
             $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
         }
-        // The client sends exactly "subscribe: <team_id>", "push" (script.js) and "react:..." (B-110).
+        // The client sends exactly "subscribe: <team_id>" (script.js) and "react:..." (B-110).
+        // B-93: "push" is no longer supported (since B-81 the API notifies via UDP); like any other unknown
+        // message it is ignored and only shows up in the "New message" log line above (without team id).
         if (str_starts_with($msg, 'subscribe:')) {
             $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
             if ($team === null) {
@@ -71,13 +73,6 @@ class MsgServer implements MessageComponentInterface {
                 $this->user_cons[$from->resourceId] = $from;
                 $this->user_subs[$from->resourceId] = $team;
                 $this->logActiveTeams();
-            }
-        } else if ($msg === 'push') {
-
-            if (isset($this->user_subs[$from->resourceId])) {
-                $team = $this->user_subs[$from->resourceId];
-                $this->logMsg(".. received a push notification to all users of team: $team");
-                $this->pullTeam($team);
             }
         } else if (str_starts_with($msg, 'react:')) {
             $this->onReact($from, $msg);
@@ -164,7 +159,7 @@ class MsgServer implements MessageComponentInterface {
 
     /**
      * Send "pull" to every connection subscribed to the given team (B-81).
-     * Used by the browser "push" and by the local UDP notification channel.
+     * Used by the local UDP notification channel (onNotify).
      */
     public function pullTeam(string $team): int {
         $cnt = 0;

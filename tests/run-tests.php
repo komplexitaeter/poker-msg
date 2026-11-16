@@ -246,10 +246,15 @@ try {
     check(in_array('pull', $ra1, true) && in_array('pull', $ra2, true), 'UDP pull:teamA reaches both teamA clients');
     check(!in_array('pull', $rb1, true), 'teamB client gets no pull');
 
+    // B-93: the browser message "push" is ignored (no pull to anyone), the connection stays usable
     $a1->send('push');
-    $ra1 = $a1->receive(0.5); $ra2 = $a2->receive(0.1); $rb1 = $b1->receive(0.1);
-    check(in_array('pull', $ra1, true) && in_array('pull', $ra2, true), 'browser push still reaches the team (incl. sender)');
+    $ra1 = $a1->receive(0.4); $ra2 = $a2->receive(0.1); $rb1 = $b1->receive(0.1);
+    check(!in_array('pull', $ra1, true) && !in_array('pull', $ra2, true), 'browser push no longer triggers a pull (B-93)');
     check(!in_array('pull', $rb1, true), 'browser push does not reach other teams');
+    usleep(150000);
+    udp(NOTIFY_PORT, 'pull:teamA');
+    check(in_array('pull', $a1->receive(0.5), true), 'UDP notification still works after an ignored push');
+    $a2->receive(0.1);
 
     // exclusive bind: another local socket must not get the port (B-81, needs ext-sockets)
     if (function_exists('socket_create')) {
@@ -269,13 +274,14 @@ try {
     check($burst === 2, "5 notifications within 100 ms give 2 pulls (got $burst)");
     $a2->receive(0.05); $b1->receive(0.05);
 
-    // WebSocket messages: exact "push" only, validated subscriptions
+    // WebSocket messages: unknown messages are ignored, validated subscriptions
     $a1->send("push\nFAKE LOG LINE");
     $a1->send('xpush');
-    check(!in_array('pull', $a2->receive(0.4), true), 'only the exact message "push" triggers a pull');
+    check(!in_array('pull', $a2->receive(0.4), true), 'unknown messages trigger no pull');
     $bad = new WsClient(WS_PORT);
     $bad->send('subscribe: ' . str_repeat('a', 81));
-    $bad->send('push');
+    usleep(100000);
+    udp(NOTIFY_PORT, 'pull:' . str_repeat('a', 81));
     check(!in_array('pull', $bad->receive(0.4), true), 'subscription with invalid team id is ignored');
     $bad->close();
     $nospace = subscribed(WS_PORT, 'teamD');
@@ -370,8 +376,8 @@ try {
     $c1 = subscribed(18445, 'teamC');
     $c2 = subscribed(18445, 'teamC');
     usleep(200000);
-    $c1->send('push');
-    check(in_array('pull', $c2->receive(0.5), true), 'WebSocket server keeps working without notify channel');
+    $c1->send('react:1:2:cake');
+    check(in_array('react:1:2:cake', $c2->receive(0.5), true), 'WebSocket server keeps working without notify channel');
     check(str_contains(file_get_contents($log), 'ERROR: notify channel udp://127.0.0.1:18446 not available'), 'bind error is logged');
     $c1->close(); $c2->close();
 } finally {

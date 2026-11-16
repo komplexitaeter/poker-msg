@@ -219,6 +219,26 @@ check(count($times) <= 10, 'state per connection stays at most 10 times (got ' .
 check(MsgServer::pruneReactTimes([1.0, 2.0], 100.0) === [], 'times older than 1 min are pruned');
 check(MsgServer::reactLimitHit([0.0, 1.0], 2.0, [1 => 1, 60 => 2]) === '1m', 'limits are configurable (array window => max)');
 
+echo "daily quota per emoji (B-139)\n";
+check(MsgServer::REACT_DAILY_QUOTA === 1 && MsgServer::REACT_QUOTA_EXEMPT === ['nudge'], 'quota 1 per code and day, nudge exempt');
+ob_start(); $q = new MsgServer(); ob_end_clean();
+$day1 = (float)gmmktime(10, 0, 0, 11, 16, 2026);
+check($q->reactQuotaTake('teamA', '11', 'heart', $day1), 'first throw of a code is allowed');
+check(!$q->reactQuotaTake('teamA', '11', 'heart', $day1 + 5), 'same code by the same thrower on the same day is dropped');
+check($q->reactQuotaTake('teamA', '11', 'cake', $day1 + 6), 'another code by the same thrower is allowed');
+check($q->reactQuotaTake('teamA', '12', 'heart', $day1 + 7), 'same code by another thrower is allowed');
+check($q->reactQuotaTake('teamB', '11', 'heart', $day1 + 8), 'same mkey in another team counts separately');
+$nudges = 0;
+for ($i = 0; $i < 5; $i++) if ($q->reactQuotaTake('teamA', '0', 'nudge', $day1 + 10 + $i)) $nudges++;
+check($nudges === 5, "nudge is exempt from the quota (got $nudges of 5)");
+check($q->reactQuotaSize() === 4, 'nudges are not counted (state ' . $q->reactQuotaSize() . ' entries)');
+$endOfDay = (float)gmmktime(23, 59, 59, 11, 16, 2026);
+check(!$q->reactQuotaTake('teamA', '11', 'heart', $endOfDay), 'still dropped at 23:59:59 UTC');
+$day2 = (float)gmmktime(0, 0, 0, 11, 17, 2026);
+check($q->reactQuotaTake('teamA', '11', 'heart', $day2), 'allowed again from 00:00 UTC of the next day');
+check($q->reactQuotaSize() === 1, 'counts of the previous day are dropped on the first throw of a new day');
+check(!$q->reactQuotaTake('teamA', '11', 'heart', $day2 + 60), 'quota applies again on the new day');
+
 echo "notifications for teams without subscribers\n";
 $srv = new MsgServer();
 ob_start();
@@ -246,10 +266,15 @@ try {
     check(in_array('pull', $ra1, true) && in_array('pull', $ra2, true), 'UDP pull:teamA reaches both teamA clients');
     check(!in_array('pull', $rb1, true), 'teamB client gets no pull');
 
+    // B-93: the browser message "push" is ignored (no pull to anyone), the connection stays usable
     $a1->send('push');
-    $ra1 = $a1->receive(0.5); $ra2 = $a2->receive(0.1); $rb1 = $b1->receive(0.1);
-    check(in_array('pull', $ra1, true) && in_array('pull', $ra2, true), 'browser push still reaches the team (incl. sender)');
+    $ra1 = $a1->receive(0.4); $ra2 = $a2->receive(0.1); $rb1 = $b1->receive(0.1);
+    check(!in_array('pull', $ra1, true) && !in_array('pull', $ra2, true), 'browser push no longer triggers a pull (B-93)');
     check(!in_array('pull', $rb1, true), 'browser push does not reach other teams');
+    usleep(150000);
+    udp(NOTIFY_PORT, 'pull:teamA');
+    check(in_array('pull', $a1->receive(0.5), true), 'UDP notification still works after an ignored push');
+    $a2->receive(0.1);
 
     // exclusive bind: another local socket must not get the port (B-81, needs ext-sockets)
     if (function_exists('socket_create')) {
@@ -269,13 +294,14 @@ try {
     check($burst === 2, "5 notifications within 100 ms give 2 pulls (got $burst)");
     $a2->receive(0.05); $b1->receive(0.05);
 
-    // WebSocket messages: exact "push" only, validated subscriptions
+    // WebSocket messages: unknown messages are ignored, validated subscriptions
     $a1->send("push\nFAKE LOG LINE");
     $a1->send('xpush');
-    check(!in_array('pull', $a2->receive(0.4), true), 'only the exact message "push" triggers a pull');
+    check(!in_array('pull', $a2->receive(0.4), true), 'unknown messages trigger no pull');
     $bad = new WsClient(WS_PORT);
     $bad->send('subscribe: ' . str_repeat('a', 81));
-    $bad->send('push');
+    usleep(100000);
+    udp(NOTIFY_PORT, 'pull:' . str_repeat('a', 81));
     check(!in_array('pull', $bad->receive(0.4), true), 'subscription with invalid team id is ignored');
     $bad->close();
     $nospace = subscribed(WS_PORT, 'teamD');
@@ -305,6 +331,20 @@ try {
     $a1->send('react:11:22:nudge');
     check($isReact($a2->receive(0.4)) === ['react:11:22:nudge'], 'reaction accepted again after 1 s');
     $a1->receive(0.05);
+
+    // B-139: daily quota per thrower (from-mkey) across connections; the rate-limited 'wave' was not counted
+    usleep(1100000);
+    $a3 = subscribed(WS_PORT, 'teamA');
+    usleep(100000);
+    foreach ([$a1, $a2] as $c) $c->receive(0.05);
+    $a3->send('react:11:22:cake');
+    check($isReact($a2->receive(0.4)) === [], 'same code by the same thrower from another connection is dropped (daily quota)');
+    $a3->send('react:11:22:wave');
+    check($isReact($a2->receive(0.4)) === ['react:11:22:wave'], 'code dropped by the rate limit before is not counted for the quota');
+    $a3->send('react:11:22:nudge');
+    check($isReact($a2->receive(0.4)) === ['react:11:22:nudge'], 'nudge is not limited by the daily quota');
+    $a3->receive(0.05); $a1->receive(0.05);
+    $a3->close();
 
     // invalid reactions and unsubscribed senders are dropped (a2 has not reacted yet, so no rate limit)
     $a2->send('react:1:2:Bomb');
@@ -344,7 +384,8 @@ try {
     check(str_contains($logText, "Notify channel listening on udp://127.0.0.1:" . NOTIFY_PORT), 'notify channel logged at start');
     check(substr_count($logText, 'invalid notification(s)') === 1, 'invalid datagrams logged once per minute');
     check(!preg_match('/^FAKE LOG LINE/m', $logText), 'no log injection via line breaks');
-    check(substr_count($logText, 'forwarded reaction') === 6, 'forwarded reactions logged');
+    check(substr_count($logText, 'forwarded reaction') === 8, 'forwarded reactions logged');
+    check(preg_match("/ignored reaction 'cake' from \\d+ \\(daily quota\\)$/m", $logText) === 1, 'reactions above the daily quota logged with code only (B-139)');
     check(!str_contains($logText, 'react:'), 'reaction content is not logged');
     check(str_contains($logText, ".. ignored reaction 'wave' from ") && !str_contains($logText, ".. ignored reaction 'clap' from ")
         && preg_match("/ignored reaction 'wave' from \\d+ \\(rate limit 1s\\)$/m", $logText) === 1, 'dropped reactions logged with code and window (B-131)');
@@ -370,8 +411,8 @@ try {
     $c1 = subscribed(18445, 'teamC');
     $c2 = subscribed(18445, 'teamC');
     usleep(200000);
-    $c1->send('push');
-    check(in_array('pull', $c2->receive(0.5), true), 'WebSocket server keeps working without notify channel');
+    $c1->send('react:1:2:cake');
+    check(in_array('react:1:2:cake', $c2->receive(0.5), true), 'WebSocket server keeps working without notify channel');
     check(str_contains(file_get_contents($log), 'ERROR: notify channel udp://127.0.0.1:18446 not available'), 'bind error is logged');
     $c1->close(); $c2->close();
 } finally {

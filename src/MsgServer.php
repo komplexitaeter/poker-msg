@@ -36,6 +36,15 @@ class MsgServer implements MessageComponentInterface {
     public const REACT_LIMITS = [1 => 3, 60 => 10];
     /** @var array<int, list<float>> resource id => times of the last forwarded reactions (oldest first) */
     private array $lastReact = [];
+    // B-139: daily quota per thrower: each sender (from-mkey within its team) may throw every code at most
+    // REACT_DAILY_QUOTA times per UTC day (00:00 UTC, the board uses the same boundary). Codes in
+    // REACT_QUOTA_EXEMPT only have the rate limit. Counted in memory only; a restart resets the quota.
+    public const REACT_DAILY_QUOTA = 1;
+    public const REACT_QUOTA_EXEMPT = ['nudge'];
+    /** @var array<string, int> "<from>:<code>:<team>" => reactions forwarded on $reactQuotaDay */
+    private array $reactQuota = [];
+    /** UTC day (Y-m-d) the counts in $reactQuota belong to */
+    private string $reactQuotaDay = '';
 
     public function __construct() {
         $this->logMsg("Starting up MsgServer");
@@ -61,7 +70,9 @@ class MsgServer implements MessageComponentInterface {
         if (!str_starts_with($msg, 'react:')) {
             $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
         }
-        // The client sends exactly "subscribe: <team_id>", "push" (script.js) and "react:..." (B-110).
+        // The client sends exactly "subscribe: <team_id>" (script.js) and "react:..." (B-110).
+        // B-93: "push" is no longer supported (since B-81 the API notifies via UDP); like any other unknown
+        // message it is ignored and only shows up in the "New message" log line above (without team id).
         if (str_starts_with($msg, 'subscribe:')) {
             $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
             if ($team === null) {
@@ -72,13 +83,6 @@ class MsgServer implements MessageComponentInterface {
                 $this->user_subs[$from->resourceId] = $team;
                 $this->logActiveTeams();
             }
-        } else if ($msg === 'push') {
-
-            if (isset($this->user_subs[$from->resourceId])) {
-                $team = $this->user_subs[$from->resourceId];
-                $this->logMsg(".. received a push notification to all users of team: $team");
-                $this->pullTeam($team);
-            }
         } else if (str_starts_with($msg, 'react:')) {
             $this->onReact($from, $msg);
         }
@@ -86,8 +90,10 @@ class MsgServer implements MessageComponentInterface {
 
     /**
      * Forward a reaction (B-110) unchanged to every connection of the sender's team, including the
-     * sender (it animates on the echo). No state besides the per-connection rate limit, nothing stored.
-     * Invalid reactions, reactions from unsubscribed connections and reactions above the limit are dropped.
+     * sender (it animates on the echo). No state besides the per-connection rate limit and the daily quota
+     * per sender (B-139, memory only). Checks in this order: format, rate limit, daily quota; invalid
+     * reactions, reactions from unsubscribed connections and reactions above a limit are dropped.
+     * Dropped reactions do not count for the rate limit or the quota.
      */
     private function onReact(ConnectionInterface $from, string $msg): void {
         $id = $from->resourceId;
@@ -110,9 +116,16 @@ class MsgServer implements MessageComponentInterface {
             $this->logMsg(".. ignored reaction '$code' from $id (rate limit $hit)");
             return;
         }
-        $times[] = $now;
         $this->lastReact[$id] = $times;
         $team = $this->user_subs[$id];
+        // B-139: the from-mkey is the second field (format validated by parseReact)
+        $sender = explode(':', $react, 3)[1];
+        if (!$this->reactQuotaTake($team, $sender, $code, $now)) {
+            $this->logMsg(".. ignored reaction '$code' from $id (daily quota)");
+            return;
+        }
+        $times[] = $now;
+        $this->lastReact[$id] = $times;
         $cnt = 0;
         foreach ($this->user_cons as $user) {
             if (($this->user_subs[$user->resourceId] ?? null) === $team) {
@@ -121,6 +134,31 @@ class MsgServer implements MessageComponentInterface {
             }
         }
         $this->logMsg(".. forwarded reaction '$code' to $cnt connection(s) of team '$team'");
+    }
+
+    /**
+     * B-139: counts one reaction of $code by sender $from in $team for the UTC day of $now and returns true,
+     * or returns false (nothing counted) if the daily quota is used up. Exempt codes always return true and are
+     * not counted. On the first call of a new UTC day all counts of the previous day are dropped.
+     */
+    public function reactQuotaTake(string $team, string $from, string $code, float $now): bool {
+        if (in_array($code, self::REACT_QUOTA_EXEMPT, true)) return true;
+        $day = gmdate('Y-m-d', (int)floor($now));
+        if ($day !== $this->reactQuotaDay) {
+            $this->reactQuota = [];
+            $this->reactQuotaDay = $day;
+        }
+        // from (digits) and code (letters) contain no ':', so the key is unambiguous for any team id
+        $key = "$from:$code:$team";
+        $cnt = $this->reactQuota[$key] ?? 0;
+        if ($cnt >= self::REACT_DAILY_QUOTA) return false;
+        $this->reactQuota[$key] = $cnt + 1;
+        return true;
+    }
+
+    /** B-139: number of entries in the daily quota state (for tests). */
+    public function reactQuotaSize(): int {
+        return count($this->reactQuota);
     }
 
     /**
@@ -164,7 +202,7 @@ class MsgServer implements MessageComponentInterface {
 
     /**
      * Send "pull" to every connection subscribed to the given team (B-81).
-     * Used by the browser "push" and by the local UDP notification channel.
+     * Used by the local UDP notification channel (onNotify).
      */
     public function pullTeam(string $team): int {
         $cnt = 0;

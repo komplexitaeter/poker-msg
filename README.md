@@ -65,8 +65,8 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 * Address: `udp://127.0.0.1:8444` (always localhost; port via `POKER_MSG_NOTIFY_PORT`).
 * Format: one datagram `pull:<team_id>`, e.g. `pull:Team_4b`. The team id has at most 80 printable ASCII characters
   without whitespace; anything else is ignored. Invalid datagrams are logged at most once per minute (with a count).
-* Effect: every connection subscribed to that team receives `pull`, exactly like after a `push` from the browser
-  (which keeps working). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
+* Effect: every connection subscribed to that team receives `pull`, the only way to trigger a `pull`
+  (B-93: the former browser message `push` is ignored like any unknown message). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
   the end of the 100 ms window (so the last change is always loaded).
   Notifications for teams without subscribers are dropped and only counted (logged at most once per minute).
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
@@ -108,10 +108,17 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
 * Rate limit (B-131): per connection, sliding windows over the forwarded reactions: at most **3 per second and 10 per
   minute** (`MsgServer::REACT_LIMITS`, window in seconds => max). Reactions
   above a limit are dropped with a log line naming the window. There is no limit per team.
+* Daily quota (B-139): in addition, every thrower may throw **each code once per UTC day** (00:00 UTC, the board
+  uses the same boundary; `MsgServer::REACT_DAILY_QUOTA`). The thrower is the `from`-mkey within its team, so the
+  quota applies across all tabs/connections of the same person. `nudge` is exempt (`MsgServer::REACT_QUOTA_EXEMPT`),
+  it only has the rate limit. Order of checks: format, rate limit, daily quota; dropped reactions count for neither.
+  Counted in memory only (cleared on the first reaction of a new UTC day, reset by a restart), log line
+  `.. ignored reaction 'heart' from 42 (daily quota)`.
 * Log (B-131): only the validated code is logged, never `from`/`to` or anything else, e.g.
   `.. forwarded reaction 'thumbsup' to 5 connection(s) of team '<team_id>'` and
   `.. ignored reaction 'thumbsup' from 42 (rate limit 1s)` (or `1m`).
-* `from` is not verified (any team member could send in someone else's name); acceptable for a fun feature.
+* `from` is not verified (any team member could send in someone else's name and so also use up someone else's
+  daily quota); acceptable for a fun feature.
   poker-msg forwards `from` as it comes; it attaches no meaning to it.
 
 ### Environment variables

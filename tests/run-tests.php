@@ -2,7 +2,7 @@
 /*
  * Integration tests for poker-msg (B-81): starts bin/msg-server.php on test ports,
  * connects minimal WebSocket clients and checks pull distribution, UDP notifications,
- * reactions (B-110), the "hb" heartbeat, the MCP wait endpoint (B-151) and that a failing UDP or HTTP bind
+ * reactions (B-110), the "hb" heartbeat, the MCP wait and react endpoints (B-151) and that a failing UDP or HTTP bind
  * does not stop the server.
  *
  * Usage: php tests/run-tests.php   (needs vendor/, ports 18443-18448 free)
@@ -317,7 +317,7 @@ try {
     $ws->onOpen($fakeConn, new GuzzleHttp\Psr7\Request('GET', waitPath('teamE', null, time() - 1)));
 } catch (\Throwable $e) { $thrown = true; }
 check(!$thrown && $fakeConn->closed && $ws->waiterCount() === 0, 'Error in onOpen is caught, connection closed, no waiter left');
-check(count($errLog) === 1 && str_starts_with($errLog[0], 'ERROR: mcp wait request failed: Error in ')
+check(count($errLog) === 1 && str_starts_with($errLog[0], 'ERROR: mcp request failed: Error in ')
     && !str_contains($errLog[0], '_mcp_wait') && !str_contains($errLog[0], WaitServer::teamHash('teamE')), 'error logged without message, URI or hash');
 
 // race memory: notification times are kept PULL_MEMORY (10 s), older ones are pruned
@@ -330,6 +330,59 @@ $ws->notePull('later', $t0 + 9.0);
 check($ws->pullStateSize() === 101, 'still kept after 9 s');
 $ws->notePull('later', $t0 + 10.5);
 check($ws->pullStateSize() === 1, 'pruned after 10 s (UDP flood does not grow the map)');
+
+echo "MCP react endpoint: parsing and rules (B-151)\n";
+$h = WaitServer::teamHash('teamM');
+check(WaitServer::parseReactPath("/_mcp_react/$h/12/345/heart") === [$h, '12', '345', 'heart'], 'valid react path');
+check(WaitServer::parseReactPath("/_mcp_react/$h/0/1234567890/nudge") !== null, 'from 0 and 10-digit mkeys accepted');
+foreach (["/_mcp_react/" . strtoupper($h) . "/12/345/heart" => 'upper-case hash', "/_mcp_react/{$h}0/12/345/heart" => '33 hex characters',
+          "/_mcp_react/$h/12345678901/345/heart" => '11-digit from', "/_mcp_react/$h/12//heart" => 'empty to',
+          "/_mcp_react/$h/12/345/Heart" => 'upper-case code', "/_mcp_react/$h/12/345/abcdefghijklm" => '13-letter code',
+          "/_mcp_react/$h/12/345/heart/" => 'trailing slash', "/_mcp_react/$h/12/345/heart\n" => 'trailing newline',
+          "/_mcp_react/$h/12/345/heart/x" => 'extra segment', "/_mcp_react/$h/-1/345/heart" => 'sign',
+          "/_mcp_wait/$h/12/345/heart" => 'other prefix'] as $bad => $what) {
+    check(WaitServer::parseReactPath($bad) === null, "react path rejected: $what");
+}
+check(WaitServer::reactResponse('ok', ['cake', 'heart']) === "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /_mcp_result/react?r=ok&used=cake,heart\r\n"
+    . "Content-Length: 0\r\nConnection: close\r\n\r\n", 'react response: 200, X-Accel-Redirect to /_mcp_result/react?r=...&used=..., empty body');
+check(str_contains(WaitServer::reactResponse('rate', []), "/_mcp_result/react?r=rate&used=\r\n"), 'react response: used empty if nothing thrown today');
+
+ob_start(); $m = new MsgServer(); ob_end_clean();
+check($m->reactFromMcp($h, '11', '22', 'heart') === ['ok', ['heart']], 'MCP reaction: ok, used lists the code');
+check($m->reactFromMcp($h, '11', '22', 'cake') === ['ok', ['cake', 'heart']], 'MCP reaction: another code ok, used sorted');
+check($m->reactFromMcp($h, '11', '33', 'heart') === ['quota', ['cake', 'heart']], 'MCP reaction: same code again (other recipient) -> quota');
+check($m->reactFromMcp($h, '12', '22', 'heart') === ['ok', ['heart']], 'MCP reaction: other thrower has its own quota and rate limit');
+check($m->reactFromMcp(WaitServer::teamHash('teamN'), '11', '22', 'heart') === ['ok', ['heart']], 'MCP reaction: same mkey in another team counts separately');
+check($m->reactFromMcp($h, '11', '22', 'party') === ['ok', ['cake', 'heart', 'party']], 'MCP reaction: the quota drop did not count for the rate limit');
+check($m->reactFromMcp($h, '11', '22', 'nudge') === ['rate', ['cake', 'heart', 'party']], 'MCP reaction: 4th forwarded try within 1 s -> rate');
+check($m->reactFromMcp($h, '13', '22', 'nudge') === ['ok', []] && $m->reactFromMcp($h, '13', '22', 'nudge') === ['ok', []],
+    'MCP nudge: exempt from the quota, not listed in used');
+check($m->reactFromMcp($h, '11', '22', 'pull') === ['invalid', []] && $m->reactFromMcp($h, '11', '22', 'xpullx') === ['invalid', []], 'MCP reaction: code containing "pull" invalid');
+check($m->reactFromMcp('nothex', '11', '22', 'heart') === ['invalid', []], 'MCP reaction: invalid hash');
+check($m->reactQuotaTake($h, '14', 'think', microtime(true)) && $m->reactFromMcp($h, '14', '22', 'think') === ['quota', ['think']],
+    'quota is shared with WebSocket throws of the same thrower (key: team hash)');
+check($m->mcpReactStateSize() === 4, 'MCP rate state per team hash and thrower (got ' . $m->mcpReactStateSize() . ')');
+
+// an \Error in the react handler must not leave the endpoint either
+$fakeConn = new class implements Ratchet\ConnectionInterface {
+    public int $resourceId = 8; public bool $closed = false; public string $sent = '';
+    public function send($data) { $this->sent .= $data; }
+    public function close() { $this->closed = true; }
+};
+$errLog = [];
+$ws = new WaitServer(React\EventLoop\Factory::create(), 10, function ($m) use (&$errLog) { $errLog[] = $m; });
+$ws->setReactHandler(function () { throw new \Error('boom'); });
+$thrown = false;
+try {
+    $ws->onOpen($fakeConn, new GuzzleHttp\Psr7\Request('GET', "/_mcp_react/$h/11/22/heart"));
+} catch (\Throwable $e) { $thrown = true; }
+check(!$thrown && $fakeConn->closed && $fakeConn->sent === '', 'Error in the react handler is caught, connection closed without redirect');
+check(count($errLog) === 1 && str_starts_with($errLog[0], 'ERROR: mcp request failed: Error in ') && !str_contains($errLog[0], $h),
+    'react error logged without message, URI or hash');
+$fakeConn->closed = false;
+$ws2 = new WaitServer(React\EventLoop\Factory::create(), 10, fn($m) => null);
+$ws2->onOpen($fakeConn, new GuzzleHttp\Psr7\Request('GET', "/_mcp_react/$h/11/22/heart"));
+check($fakeConn->closed && str_starts_with($fakeConn->sent, 'HTTP/1.1 400'), 'without react handler: 400');
 
 /* ---------- integration: running server ---------- */
 
@@ -576,10 +629,63 @@ try {
     check($isPull(waitRead($w9, 0.5), $dl), 'new waiter of the aborted team gets the pull');
     fclose($w9); fclose($ws1[1]); fclose($ws1[2]);
 
+    // B-151: MCP reactions, same rules as WebSocket reactions, distributed to the team's WebSocket connections
+    $react = function (string $team, string $from, string $to, string $code, string $method = 'GET'): ?string {
+        $s = waitOpen(HTTP_PORT, '/_mcp_react/' . WaitServer::teamHash($team) . "/$from/$to/$code", $method);
+        $r = waitRead($s, 0.5);
+        fclose($s);
+        return $r;
+    };
+    $hasResult = fn(?string $r, string $q) => $r !== null && str_starts_with($r, "HTTP/1.1 200 OK\r\n")
+        && str_contains($r, "\r\nX-Accel-Redirect: /_mcp_result/react?$q\r\n") && str_contains($r, "\r\nContent-Length: 0\r\n");
+    $isReact = fn(array $msgs) => array_values(array_filter($msgs, fn($m) => str_starts_with($m, 'react:')));
+    $m1 = subscribed(WS_PORT, 'teamM');
+    $m2 = subscribed(WS_PORT, 'teamM');
+    $o1 = subscribed(WS_PORT, 'teamO');
+    usleep(150000);
+    check($hasResult($react('teamM', '21', '22', 'cake'), 'r=ok&used=cake'), 'MCP reaction: r=ok&used=cake');
+    check($isReact($m1->receive(0.4)) === ['react:21:22:cake'] && $isReact($m2->receive(0.1)) === ['react:21:22:cake'],
+        'MCP reaction reaches every WebSocket connection of the team');
+    check($isReact($o1->receive(0.1)) === [], 'MCP reaction does not reach other teams');
+    check($hasResult($react('teamM', '21', '23', 'cake'), 'r=quota&used=cake'), 'same code again: r=quota');
+    check($isReact($m1->receive(0.3)) === [], 'reaction above the quota is not distributed');
+    // the thrower has its own (WebSocket) connection as well: quota shared, rate limit separate
+    $m1->send('react:21:22:heart');
+    check($isReact($m2->receive(0.4)) === ['react:21:22:heart'], 'WebSocket throw of the same thrower');
+    check($hasResult($react('teamM', '21', '22', 'heart'), 'r=quota&used=cake,heart'), 'WebSocket and MCP share the daily quota (used lists both)');
+    $m1->receive(0.1); $m2->receive(0.1);
+    // rate limit per team hash and thrower: 3 per second
+    $r41 = [$react('teamM', '41', '22', 'cake'), $react('teamM', '41', '22', 'heart'), $react('teamM', '41', '22', 'party'), $react('teamM', '41', '22', 'think')];
+    check($hasResult($r41[0], 'r=ok&used=cake') && $hasResult($r41[1], 'r=ok&used=cake,heart') && $hasResult($r41[2], 'r=ok&used=cake,heart,party'),
+        '3 MCP reactions within 1 s: r=ok');
+    check($hasResult($r41[3], 'r=rate&used=cake,heart,party'), '4th MCP try within 1 s: r=rate, not counted for the quota');
+    check($isReact($m2->receive(0.4)) === ['react:41:22:cake', 'react:41:22:heart', 'react:41:22:party'], 'only the 3 accepted reactions are distributed');
+    $m1->receive(0.1);
+    usleep(1000000);
+    check($hasResult($react('teamM', '41', '22', 'nudge'), 'r=ok&used=cake,heart,party'), 'after 1 s accepted again (nudge exempt from the quota)');
+    check($isReact($m2->receive(0.4)) === ['react:41:22:nudge'], 'nudge distributed with from as given by PHP');
+    $m1->receive(0.1);
+    check($hasResult($react('teamQ', '1', '2', 'party'), 'r=ok&used=party'), 'team without WebSocket subscribers: r=ok (counted, nobody to deliver to)');
+    foreach (['/_mcp_react/abc/1/2/heart', '/_mcp_react/' . WaitServer::teamHash('teamM') . '/1/2/pull',
+              '/_mcp_react/' . WaitServer::teamHash('teamM') . '/1/2/heart/x', '/_mcp_react/' . WaitServer::teamHash('teamM') . '/1/2/Heart',
+              '/_mcp_react/'] as $bad) {
+        $b = waitOpen(HTTP_PORT, $bad);
+        $rb = waitRead($b, 0.5);
+        check($rb !== null && str_starts_with($rb, 'HTTP/1.1 400') && !str_contains($rb, 'X-Accel-Redirect'), "invalid react path '$bad': 400 without redirect");
+        fclose($b);
+    }
+    $rp = $react('teamM', '31', '22', 'think', 'POST');
+    check($rp !== null && str_starts_with($rp, 'HTTP/1.1 400'), 'react via POST: 400');
+    check($isReact($m1->receive(0.3)) === [], 'invalid react requests are not distributed');
+    check($hasResult($react('teamM', '31', '22', 'think'), 'r=ok&used=think'), 'endpoint still works after invalid requests');
+    $m1->close(); $m2->close(); $o1->close();
+
     usleep(200000);
     $logText = file_get_contents($log);
     check(str_contains($logText, 'MCP wait endpoint listening on http://127.0.0.1:' . HTTP_PORT . ' (max 3 waiters)'), 'wait endpoint logged at start');
     check(!str_contains($logText, '_mcp_wait') && !str_contains($logText, WaitServer::teamHash('teamW')), 'no wait URIs or team hashes in the log');
+    check(!str_contains($logText, '_mcp_react') && !str_contains($logText, WaitServer::teamHash('teamM'))
+        && substr_count($logText, 'forwarded reaction') === 1 && !str_contains($logText, '21:22'), 'MCP reactions: no URIs, hashes, mkeys or per-reaction lines in the log (only the WebSocket throw)');
     check(!str_contains($logText, 'ERROR'), 'no errors logged');
 } finally {
     stopServer($proc);

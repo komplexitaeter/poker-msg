@@ -24,7 +24,7 @@ $heartbeatInterval = (float)(getenv('POKER_MSG_HEARTBEAT') ?: 30);
 // B-81: local UDP port for notifications from the web server ("pull:<team_id>"), bound to 127.0.0.1 only.
 $notifyPort = (int)(getenv('POKER_MSG_NOTIFY_PORT') ?: 8444);
 
-// B-151: internal HTTP wait endpoint for MCP wait_for_change (127.0.0.1 only, nginx /_mcp_wait/), 0 = off.
+// B-151: internal HTTP endpoint for MCP wait_for_change and react (127.0.0.1 only, nginx /_mcp_wait/, /_mcp_react/), 0 = off.
 // getenv() instead of "?:" here, because "0" is a valid value.
 $waitPort = getenv('POKER_MSG_HTTP_PORT') !== false && getenv('POKER_MSG_HTTP_PORT') !== '' ? (int)getenv('POKER_MSG_HTTP_PORT') : 8445;
 // B-151: at most this many concurrent waiters, further requests are answered with r=busy at once.
@@ -73,6 +73,8 @@ if ($waitPort > 0) {
         // Connections without complete headers after 5 s are closed (nginx sends them at once).
         new IoServer(new HeaderTimeout(new HttpServer($waitServer), $server->loop, 5.0), $waitSocket, $server->loop);
         $msgServer->setWaitServer($waitServer);
+        // B-151: MCP reactions (/_mcp_react/) on the same listener, same rules as WebSocket reactions
+        $waitServer->setReactHandler([$msgServer, 'reactFromMcp']);
         $server->loop->addPeriodicTimer(WaitServer::LOG_INTERVAL, function () use ($waitServer) {
             $waitServer->logStats();
         });

@@ -2,18 +2,21 @@
 /*
  * Integration tests for poker-msg (B-81): starts bin/msg-server.php on test ports,
  * connects minimal WebSocket clients and checks pull distribution, UDP notifications,
- * reactions (B-110), the "hb" heartbeat and that a failing UDP bind does not stop the server.
+ * reactions (B-110), the "hb" heartbeat, the MCP wait endpoint (B-151) and that a failing UDP or HTTP bind
+ * does not stop the server.
  *
- * Usage: php tests/run-tests.php   (needs vendor/, ports 18443/18444 and 18445/18446 free)
+ * Usage: php tests/run-tests.php   (needs vendor/, ports 18443-18448 free)
  * Exit code 0 = all passed.
  */
 
 const WS_PORT = 18443;
 const NOTIFY_PORT = 18444;
+const HTTP_PORT = 18447;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
 use PokerMsg\MsgServer;
+use PokerMsg\WaitServer;
 
 $failures = 0;
 function check(bool $ok, string $name): void {
@@ -103,13 +106,15 @@ final class WsClient {
 /* ---------- helpers ---------- */
 
 /** @return array{0: resource, 1: string} process and log file */
-function startServer(int $wsPort, int $notifyPort, string $heartbeat): array {
+function startServer(int $wsPort, int $notifyPort, string $heartbeat, int $httpPort = 0, int $maxWait = 2000): array {
     $log = tempnam(sys_get_temp_dir(), 'poker-msg-test');
     $env = array_merge(getenv(), [
         'POKER_MSG_PORT' => (string)$wsPort,
         'POKER_MSG_NOTIFY_PORT' => (string)$notifyPort,
         'POKER_MSG_HEARTBEAT' => $heartbeat,
         'POKER_MSG_KEEPALIVE' => '60',
+        'POKER_MSG_HTTP_PORT' => (string)$httpPort,
+        'POKER_MSG_MCP_MAX_WAIT' => (string)$maxWait,
     ]);
     $cmd = [PHP_BINARY, dirname(__DIR__) . '/bin/msg-server.php'];
     $proc = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['file', $log, 'w'], 2 => ['file', $log, 'a']], $pipes, null, $env);
@@ -132,6 +137,38 @@ function udp(int $port, string $msg): void {
     $s = stream_socket_client("udp://127.0.0.1:$port", $errno, $errstr);
     fwrite($s, $msg);
     fclose($s);
+}
+
+/** B-151: opens a request to the wait endpoint like nginx does (GET, no body); returns the socket. */
+function waitOpen(int $port, string $path, string $method = 'GET') {
+    $s = stream_socket_client("tcp://127.0.0.1:$port", $errno, $errstr, 2);
+    if ($s === false) throw new RuntimeException("connect failed: $errstr");
+    fwrite($s, "$method $path HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nConnection: close\r\n\r\n");
+    stream_set_blocking($s, false);
+    return $s;
+}
+
+/** Reads until the server closes the connection or $seconds pass; returns the response or null if none. */
+function waitRead($s, float $seconds): ?string {
+    $buf = '';
+    $deadline = microtime(true) + $seconds;
+    while (microtime(true) < $deadline) {
+        $r = [$s]; $w = null; $e = null;
+        $left = max(0, $deadline - microtime(true));
+        if (@stream_select($r, $w, $e, (int)$left, (int)(($left - (int)$left) * 1e6)) > 0) {
+            $chunk = fread($s, 8192);
+            if (($chunk === '' || $chunk === false) && feof($s)) return $buf;
+            $buf .= (string)$chunk;
+        }
+    }
+    return $buf === '' ? null : $buf;
+}
+
+/** Wait path for a team: /_mcp_wait/<hash>/<checked ms>/<deadline s>/<hop> */
+function waitPath(string $team, ?int $checkedMs = null, ?int $deadline = null, int $hop = 1): string {
+    $checkedMs ??= (int)floor(microtime(true) * 1000);
+    $deadline ??= time() + 20;
+    return '/_mcp_wait/' . WaitServer::teamHash($team) . "/$checkedMs/$deadline/$hop";
 }
 
 function subscribed(int $port, string $team): WsClient {
@@ -248,6 +285,51 @@ check(substr_count($out, "\n") === 1 && substr_count($out, 'teams without subscr
     'no log line per notification (1 line for 50 notifications)');
 check(!str_contains($out, 'New notification'), 'no pull logged for teams without subscribers');
 check($srv->notifyStateSize() === 0, 'no state kept for teams without subscribers');
+
+echo "MCP wait endpoint: parsing (B-151)\n";
+check(WaitServer::teamHash('Team_4b') === substr(hash('sha256', 'Team_4b'), 0, 32), 'team hash = first 32 hex characters of sha256(team id)');
+$h = WaitServer::teamHash('Team_4b');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/1") === [$h, '1764190000123', '1764190025', '1'], 'valid wait path');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/3") !== null, 'hop 3 accepted');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/4") === null, 'hop 4 rejected');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/0") === null, 'hop 0 rejected');
+check(WaitServer::parsePath("/_mcp_wait/" . strtoupper($h) . "/1764190000123/1764190025/1") === null, 'upper-case hash rejected');
+check(WaitServer::parsePath("/_mcp_wait/{$h}0/1764190000123/1764190025/1") === null, '33 hex characters rejected');
+check(WaitServer::parsePath("/_mcp_wait/$h/176419000012/1764190025/1") === null, 'checked with 12 digits rejected');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/176419002/1") === null, 'deadline with 9 digits rejected');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/1/") === null, 'trailing slash rejected');
+check(WaitServer::parsePath("/_mcp_wait/$h/1764190000123/1764190025/1\n") === null, 'trailing newline rejected');
+check(WaitServer::parsePath("/_mcp_result/$h/1764190000123/1764190025/1") === null, 'other prefix rejected');
+check(WaitServer::resultResponse('1764190025', '2', 'pull') === "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /_mcp_result/1764190025/2?r=pull\r\n"
+    . "Content-Length: 0\r\nConnection: close\r\n\r\n", 'response: 200, X-Accel-Redirect to /_mcp_result/<deadline>/<hop>?r=..., empty body');
+
+echo "MCP wait endpoint: robustness (B-151)\n";
+// an \Error inside onOpen must not leave the endpoint (IoServer only catches \Exception, it would end the loop)
+$fakeConn = new class implements Ratchet\ConnectionInterface {
+    public int $resourceId = 7; public bool $closed = false;
+    public function send($data) { throw new \Error('boom /_mcp_wait/secret'); }
+    public function close() { $this->closed = true; }
+};
+$errLog = [];
+$ws = new WaitServer(React\EventLoop\Factory::create(), 10, function ($m) use (&$errLog) { $errLog[] = $m; });
+$thrown = false;
+try {
+    $ws->onOpen($fakeConn, new GuzzleHttp\Psr7\Request('GET', waitPath('teamE', null, time() - 1)));
+} catch (\Throwable $e) { $thrown = true; }
+check(!$thrown && $fakeConn->closed && $ws->waiterCount() === 0, 'Error in onOpen is caught, connection closed, no waiter left');
+check(count($errLog) === 1 && str_starts_with($errLog[0], 'ERROR: mcp wait request failed: Error in ')
+    && !str_contains($errLog[0], '_mcp_wait') && !str_contains($errLog[0], WaitServer::teamHash('teamE')), 'error logged without message, URI or hash');
+
+// race memory: notification times are kept PULL_MEMORY (10 s), older ones are pruned
+check(WaitServer::PULL_MEMORY === 10.0, 'pull times are kept 10 s');
+$ws = new WaitServer(React\EventLoop\Factory::create(), 10, fn($m) => null);
+$t0 = 1764190000.0;
+for ($i = 0; $i < 100; $i++) $ws->notePull("flood$i", $t0);
+check($ws->pullStateSize() === 100, 'pull times of 100 teams kept');
+$ws->notePull('later', $t0 + 9.0);
+check($ws->pullStateSize() === 101, 'still kept after 9 s');
+$ws->notePull('later', $t0 + 10.5);
+check($ws->pullStateSize() === 1, 'pruned after 10 s (UDP flood does not grow the map)');
 
 /* ---------- integration: running server ---------- */
 
@@ -397,6 +479,121 @@ try {
     stopServer($proc);
 }
 
+echo "MCP wait endpoint (http " . HTTP_PORT . ", max 3 waiters)\n";
+[$proc, $log] = startServer(WS_PORT, NOTIFY_PORT, '0', HTTP_PORT, 3);
+try {
+    $isPull = fn(?string $r, string $deadline, string $hop = '1') => $r !== null && str_starts_with($r, "HTTP/1.1 200 OK\r\n")
+        && str_contains($r, "\r\nX-Accel-Redirect: /_mcp_result/$deadline/$hop?r=pull\r\n") && str_contains($r, "\r\nContent-Length: 0\r\n");
+
+    // waiter of a team without any WebSocket subscriber wakes on the UDP pull for that team
+    $dl = (string)(time() + 20);
+    $w1 = waitOpen(HTTP_PORT, waitPath('teamW', null, (int)$dl, 2));
+    usleep(150000);
+    check(waitRead($w1, 0.3) === null, 'waiter is held (no answer without a pull)');
+    udp(NOTIFY_PORT, 'pull:teamX');
+    check(waitRead($w1, 0.3) === null, 'pull for another team does not wake the waiter');
+    udp(NOTIFY_PORT, 'pull:teamW');
+    check($isPull(waitRead($w1, 1.0), $dl, '2'), 'UDP pull wakes the waiter: r=pull, deadline and hop echoed (team without WebSocket subscribers)');
+    fclose($w1);
+
+    // WebSocket subscribers and waiters of the same team both get the pull
+    usleep(150000);
+    $ws = subscribed(WS_PORT, 'teamV');
+    $w2 = waitOpen(HTTP_PORT, waitPath('teamV', null, (int)$dl));
+    $w3 = waitOpen(HTTP_PORT, waitPath('teamV', null, (int)$dl));
+    usleep(150000);
+    udp(NOTIFY_PORT, 'pull:teamV');
+    check(in_array('pull', $ws->receive(0.5), true), 'WebSocket subscriber still gets the pull');
+    check($isPull(waitRead($w2, 0.5), $dl) && $isPull(waitRead($w3, 0.5), $dl), 'both waiters of the team get the pull');
+    fclose($w2); fclose($w3); $ws->close();
+
+    // race: a pull after "checked" (written while PHP was computing the view) answers at once
+    $before = (int)floor(microtime(true) * 1000) - 50;
+    udp(NOTIFY_PORT, 'pull:teamR');
+    usleep(150000);
+    $t0 = microtime(true);
+    $w4 = waitOpen(HTTP_PORT, waitPath('teamR', $before, (int)$dl));
+    check($isPull(waitRead($w4, 0.5), $dl) && microtime(true) - $t0 < 0.3, 'pull after checked: r=pull at once (race protection, team without subscribers)');
+    fclose($w4);
+    $w5 = waitOpen(HTTP_PORT, waitPath('teamR', null, (int)$dl));
+    check(waitRead($w5, 0.4) === null, 'pull before checked: waiter is held');
+    fclose($w5);
+
+    // deadline: timeout at the deadline, at once if already over
+    $dl2 = time() + 2;
+    $t0 = microtime(true);
+    $w6 = waitOpen(HTTP_PORT, waitPath('teamT', null, $dl2, 3));
+    $r6 = waitRead($w6, 3.5);
+    $took = microtime(true) - $t0;
+    check($r6 !== null && str_contains($r6, "X-Accel-Redirect: /_mcp_result/$dl2/3?r=timeout\r\n"), 'r=timeout at the deadline');
+    check($took >= $dl2 - $t0 - 0.1 && $took <= $dl2 - $t0 + 0.5, sprintf('timeout comes at the deadline (after %.2f s)', $took));
+    fclose($w6);
+    $past = time() - 1;
+    $w7 = waitOpen(HTTP_PORT, waitPath('teamT', null, $past));
+    $r7 = waitRead($w7, 0.5);
+    check($r7 !== null && str_contains($r7, "X-Accel-Redirect: /_mcp_result/$past/1?r=timeout\r\n"), 'deadline already over: r=timeout at once');
+    fclose($w7);
+
+    // connections without complete headers are closed after 5 s; a complete waiter is held longer
+    $dl3 = time() + 7;
+    $held = waitOpen(HTTP_PORT, waitPath('teamH', null, $dl3));
+    $partial = stream_socket_client('tcp://127.0.0.1:' . HTTP_PORT, $errno, $errstr, 2);
+    fwrite($partial, "GET /_mcp_wait/");
+    stream_set_blocking($partial, false);
+    $t0 = microtime(true);
+    $rp = waitRead($partial, 6.5);
+    $took = microtime(true) - $t0;
+    check($rp === '' && $took >= 4.5 && $took < 6.0, sprintf('incomplete headers: closed after 5 s (%.2f s)', $took));
+    fclose($partial);
+    $rh = waitRead($held, 3.0);
+    check($rh !== null && str_contains($rh, "?r=timeout\r\n"), 'complete waiter is not closed by the header timeout (held until its deadline)');
+    fclose($held);
+
+    // invalid requests get 400 and no redirect
+    foreach (['/_mcp_wait/abc/1/2/1', '/', '/_mcp_wait/' . WaitServer::teamHash('x') . '/1764190000123/1764190025/9'] as $bad) {
+        $b = waitOpen(HTTP_PORT, $bad);
+        $rb = waitRead($b, 0.5);
+        check($rb !== null && str_starts_with($rb, 'HTTP/1.1 400') && !str_contains($rb, 'X-Accel-Redirect'), "invalid path '$bad': 400 without redirect");
+        fclose($b);
+    }
+    $b = waitOpen(HTTP_PORT, waitPath('teamW'), 'POST');
+    $rb = waitRead($b, 0.5);
+    check($rb !== null && str_starts_with($rb, 'HTTP/1.1 400'), 'POST: 400');
+    fclose($b);
+
+    // global cap (3 here): the 4th concurrent waiter gets r=busy at once; aborted waiters free their place
+    $ws1 = []; for ($i = 0; $i < 3; $i++) $ws1[] = waitOpen(HTTP_PORT, waitPath("teamB$i", null, (int)$dl));
+    usleep(150000);
+    $w8 = waitOpen(HTTP_PORT, waitPath('teamB9', null, (int)$dl, 2));
+    $r8 = waitRead($w8, 0.5);
+    check($r8 !== null && str_contains($r8, "X-Accel-Redirect: /_mcp_result/$dl/2?r=busy\r\n"), 'above the cap: r=busy at once');
+    fclose($w8);
+    fclose($ws1[0]);  // client abort: nginx closes the upstream connection
+    usleep(150000);
+    $w9 = waitOpen(HTTP_PORT, waitPath('teamB0', null, (int)$dl));
+    check(waitRead($w9, 0.4) === null, 'after an abort the place is free again (waiter removed on close)');
+    udp(NOTIFY_PORT, 'pull:teamB0');
+    check($isPull(waitRead($w9, 0.5), $dl), 'new waiter of the aborted team gets the pull');
+    fclose($w9); fclose($ws1[1]); fclose($ws1[2]);
+
+    usleep(200000);
+    $logText = file_get_contents($log);
+    check(str_contains($logText, 'MCP wait endpoint listening on http://127.0.0.1:' . HTTP_PORT . ' (max 3 waiters)'), 'wait endpoint logged at start');
+    check(!str_contains($logText, '_mcp_wait') && !str_contains($logText, WaitServer::teamHash('teamW')), 'no wait URIs or team hashes in the log');
+    check(!str_contains($logText, 'ERROR'), 'no errors logged');
+} finally {
+    stopServer($proc);
+}
+
+echo "MCP wait endpoint disabled (POKER_MSG_HTTP_PORT=0)\n";
+[$proc, $log] = startServer(WS_PORT, NOTIFY_PORT, '0', 0);
+try {
+    check(@stream_socket_client('tcp://127.0.0.1:' . HTTP_PORT, $errno, $errstr, 0.5) === false, 'no listener on the wait port');
+    check(str_contains(file_get_contents($log), 'MCP wait endpoint disabled'), 'disabled endpoint is logged');
+} finally {
+    stopServer($proc);
+}
+
 echo "bind error (udp port already in use)\n";
 // Block the port without SO_REUSEADDR (stream_socket_server sets it, so a second bind would succeed).
 if (!function_exists('socket_create')) {
@@ -406,7 +603,8 @@ if (!function_exists('socket_create')) {
 }
 $blocker = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
 socket_bind($blocker, '127.0.0.1', 18446);
-[$proc, $log] = startServer(18445, 18446, '0');
+$httpBlocker = stream_socket_server('tcp://127.0.0.1:18448');   // B-151: wait port in use as well
+[$proc, $log] = startServer(18445, 18446, '0', 18448);
 try {
     $c1 = subscribed(18445, 'teamC');
     $c2 = subscribed(18445, 'teamC');
@@ -414,10 +612,12 @@ try {
     $c1->send('react:1:2:cake');
     check(in_array('react:1:2:cake', $c2->receive(0.5), true), 'WebSocket server keeps working without notify channel');
     check(str_contains(file_get_contents($log), 'ERROR: notify channel udp://127.0.0.1:18446 not available'), 'bind error is logged');
+    check(str_contains(file_get_contents($log), 'ERROR: MCP wait endpoint 127.0.0.1:18448 not available'), 'wait endpoint bind error is logged, server keeps running (B-151)');
     $c1->close(); $c2->close();
 } finally {
     stopServer($proc);
     socket_close($blocker);
+    fclose($httpBlocker);
 }
 
 echo $failures === 0 ? "ALL PASSED\n" : "$failures FAILED\n";

@@ -17,6 +17,8 @@ class MsgServer implements MessageComponentInterface {
     public const INVALID_LOG_INTERVAL = 60;
 
     private ?LoopInterface $loop = null;
+    /** B-151: MCP wait endpoint; its waiters count as subscribers of their team */
+    private ?WaitServer $wait = null;
     /** @var array<string, float> team id => time of the last pull sent for a notification */
     private array $lastNotify = [];
     /** @var array<string, int> team id => notifications merged into the scheduled trailing pull */
@@ -56,6 +58,11 @@ class MsgServer implements MessageComponentInterface {
     /** Event loop for timers (merging notifications); without it every notification is sent at once. */
     public function setLoop(LoopInterface $loop): void {
         $this->loop = $loop;
+    }
+
+    /** B-151: every pull for a team also wakes the MCP waiters of that team. */
+    public function setWaitServer(WaitServer $wait): void {
+        $this->wait = $wait;
     }
 
     public function onOpen(ConnectionInterface $conn) {
@@ -226,8 +233,11 @@ class MsgServer implements MessageComponentInterface {
             $this->countIgnored('invalid notification(s)', 'last one ' . strlen($data) . ' bytes');
             return;
         }
-        // Nobody is watching this team: drop early, no log line per notification, no state.
-        if (!in_array($team, $this->user_subs, true)) {
+        // B-151: remember the time for every team (race check of MCP waiters that are just on their way here).
+        $this->wait?->notePull($team);
+        // Nobody is watching this team (no WebSocket subscriber, no MCP waiter): drop early,
+        // no log line per notification, no further state.
+        if (!in_array($team, $this->user_subs, true) && !($this->wait?->hasWaiters($team))) {
             $this->countIgnored('notification(s) for teams without subscribers', "last one for '$team'");
             return;
         }
@@ -283,6 +293,7 @@ class MsgServer implements MessageComponentInterface {
         }
         $this->logMsg("New notification: pull for team '$team'" . ($merged > 1 ? " ($merged merged)" : ""));
         $this->pullTeam($team);
+        $this->wait?->wake($team);
     }
 
     /** Printable, shortened version of client input for the log (no line breaks or control characters). */

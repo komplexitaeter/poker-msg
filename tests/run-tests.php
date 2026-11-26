@@ -303,6 +303,34 @@ check(WaitServer::parsePath("/_mcp_result/$h/1764190000123/1764190025/1") === nu
 check(WaitServer::resultResponse('1764190025', '2', 'pull') === "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /_mcp_result/1764190025/2?r=pull\r\n"
     . "Content-Length: 0\r\nConnection: close\r\n\r\n", 'response: 200, X-Accel-Redirect to /_mcp_result/<deadline>/<hop>?r=..., empty body');
 
+echo "MCP wait endpoint: robustness (B-151)\n";
+// an \Error inside onOpen must not leave the endpoint (IoServer only catches \Exception, it would end the loop)
+$fakeConn = new class implements Ratchet\ConnectionInterface {
+    public int $resourceId = 7; public bool $closed = false;
+    public function send($data) { throw new \Error('boom /_mcp_wait/secret'); }
+    public function close() { $this->closed = true; }
+};
+$errLog = [];
+$ws = new WaitServer(React\EventLoop\Factory::create(), 10, function ($m) use (&$errLog) { $errLog[] = $m; });
+$thrown = false;
+try {
+    $ws->onOpen($fakeConn, new GuzzleHttp\Psr7\Request('GET', waitPath('teamE', null, time() - 1)));
+} catch (\Throwable $e) { $thrown = true; }
+check(!$thrown && $fakeConn->closed && $ws->waiterCount() === 0, 'Error in onOpen is caught, connection closed, no waiter left');
+check(count($errLog) === 1 && str_starts_with($errLog[0], 'ERROR: mcp wait request failed: Error in ')
+    && !str_contains($errLog[0], '_mcp_wait') && !str_contains($errLog[0], WaitServer::teamHash('teamE')), 'error logged without message, URI or hash');
+
+// race memory: notification times are kept PULL_MEMORY (10 s), older ones are pruned
+check(WaitServer::PULL_MEMORY === 10.0, 'pull times are kept 10 s');
+$ws = new WaitServer(React\EventLoop\Factory::create(), 10, fn($m) => null);
+$t0 = 1764190000.0;
+for ($i = 0; $i < 100; $i++) $ws->notePull("flood$i", $t0);
+check($ws->pullStateSize() === 100, 'pull times of 100 teams kept');
+$ws->notePull('later', $t0 + 9.0);
+check($ws->pullStateSize() === 101, 'still kept after 9 s');
+$ws->notePull('later', $t0 + 10.5);
+check($ws->pullStateSize() === 1, 'pruned after 10 s (UDP flood does not grow the map)');
+
 /* ---------- integration: running server ---------- */
 
 echo "server (ws " . WS_PORT . ", udp " . NOTIFY_PORT . ", heartbeat 1s)\n";
@@ -505,6 +533,21 @@ try {
     $r7 = waitRead($w7, 0.5);
     check($r7 !== null && str_contains($r7, "X-Accel-Redirect: /_mcp_result/$past/1?r=timeout\r\n"), 'deadline already over: r=timeout at once');
     fclose($w7);
+
+    // connections without complete headers are closed after 5 s; a complete waiter is held longer
+    $dl3 = time() + 7;
+    $held = waitOpen(HTTP_PORT, waitPath('teamH', null, $dl3));
+    $partial = stream_socket_client('tcp://127.0.0.1:' . HTTP_PORT, $errno, $errstr, 2);
+    fwrite($partial, "GET /_mcp_wait/");
+    stream_set_blocking($partial, false);
+    $t0 = microtime(true);
+    $rp = waitRead($partial, 6.5);
+    $took = microtime(true) - $t0;
+    check($rp === '' && $took >= 4.5 && $took < 6.0, sprintf('incomplete headers: closed after 5 s (%.2f s)', $took));
+    fclose($partial);
+    $rh = waitRead($held, 3.0);
+    check($rh !== null && str_contains($rh, "?r=timeout\r\n"), 'complete waiter is not closed by the header timeout (held until its deadline)');
+    fclose($held);
 
     // invalid requests get 400 and no redirect
     foreach (['/_mcp_wait/abc/1/2/1', '/', '/_mcp_wait/' . WaitServer::teamHash('x') . '/1764190000123/1764190025/9'] as $bad) {

@@ -22,8 +22,11 @@ final class WaitServer implements HttpServerInterface {
     public const PATH_PATTERN = '#^/_mcp_wait/([0-9a-f]{32})/(\d{13})/(\d{10})/([1-3])$#D';
     /** A waiter is never held longer than this (seconds), whatever the deadline says (nginx proxy_read_timeout 35s). */
     public const MAX_HOLD = 30.0;
-    /** Pull times are kept this long (seconds) for the race check; older ones cannot be after a fresh "checked". */
-    public const PULL_MEMORY = 60.0;
+    /**
+     * Pull times are kept this long (seconds) for the race check. The race (PHP computed the view -> waiter arrives
+     * here) takes milliseconds; a short memory bounds the map even under a flood of UDP notifications.
+     */
+    public const PULL_MEMORY = 10.0;
     /** Counters are logged once per this interval (seconds), only if something happened. */
     public const LOG_INTERVAL = 60;
 
@@ -75,8 +78,8 @@ final class WaitServer implements HttpServerInterface {
      * Records a pull notification for a team (called on every valid notification, also for teams without any
      * subscriber or waiter), so a waiter that arrives later with an older "checked" is answered at once.
      */
-    public function notePull(string $team): void {
-        $now = microtime(true);
+    public function notePull(string $team, ?float $now = null): void {
+        $now ??= microtime(true);
         $this->lastPull[self::teamHash($team)] = $now * 1000;
         if ($now - $this->lastPruneAt >= 1.0) {   // keep the map small, at most once per second
             $this->lastPruneAt = $now;
@@ -110,6 +113,19 @@ final class WaitServer implements HttpServerInterface {
     }
 
     public function onOpen(ConnectionInterface $conn, ?RequestInterface $request = null) {
+        // IoServer only catches \Exception; an \Error escaping here would end the loop and with it every board.
+        try {
+            $this->handleRequest($conn, $request);
+        } catch (\Throwable $e) {
+            $id = $conn->resourceId ?? null;
+            if ($id !== null) $this->remove($id);
+            // No message: it might contain parts of the request. Class and place are enough to find the bug.
+            ($this->log)('ERROR: mcp wait request failed: ' . get_class($e) . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
+            try { $conn->close(); } catch (\Throwable $ignored) {}
+        }
+    }
+
+    private function handleRequest(ConnectionInterface $conn, ?RequestInterface $request): void {
         if ($request === null) {
             $conn->close();
             return;

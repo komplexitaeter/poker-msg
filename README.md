@@ -144,11 +144,13 @@ proxies that internal location to this endpoint, which hands the request back to
   `X-Accel-Redirect: /_mcp_result/<deadline>/<hop>?r=<reason>` (deadline and hop as received), with `<reason>`:
   * `pull`: a pull notification for the team (same place and same 100 ms merging as the WebSocket `pull`);
     also at once if the last notification for that team came at or after `checked` (race: a change written while
-    PHP was computing the view must not get lost; notification times are kept 60 s for every team, also without
+    PHP was computing the view must not get lost; notification times are kept 10 s for every team, also without
     subscribers);
   * `timeout`: the deadline was reached (at once if it is already over; never held longer than 30 s);
   * `busy`: at once if `POKER_MSG_MCP_MAX_WAIT` waiters (default 2000) are already waiting.
 * Client abort: nginx closes the upstream connection, the waiter is removed and its place is free again.
+* Connections without complete HTTP headers after 5 s are closed (nginx sends them at once). An unexpected error
+  while handling a request is caught, logged (class and place only) and closes only that connection.
 * Log: only counters, once per minute if anything happened, e.g.
   `mcp_wait: waiting=3, started=40, pull=25, timeout=12, busy=0, aborted=1, invalid=0` - never URIs, hashes or team ids.
 * Security: bound to 127.0.0.1; a local process can call it, but only gets a header text back (the result location

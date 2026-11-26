@@ -5,6 +5,7 @@ use Ratchet\Server\IoServer;
 use PokerMsg\MsgServer;
 use PokerMsg\NotifySocket;
 use PokerMsg\WaitServer;
+use PokerMsg\HeaderTimeout;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -69,7 +70,8 @@ if ($waitPort > 0) {
     try {
         $waitSocket = new React\Socket\Server("127.0.0.1:$waitPort", $server->loop);
         $waitServer = new WaitServer($server->loop, $maxWait, [$msgServer, 'logMsg']);
-        new IoServer(new HttpServer($waitServer), $waitSocket, $server->loop);
+        // Connections without complete headers after 5 s are closed (nginx sends them at once).
+        new IoServer(new HeaderTimeout(new HttpServer($waitServer), $server->loop, 5.0), $waitSocket, $server->loop);
         $msgServer->setWaitServer($waitServer);
         $server->loop->addPeriodicTimer(WaitServer::LOG_INTERVAL, function () use ($waitServer) {
             $waitServer->logStats();

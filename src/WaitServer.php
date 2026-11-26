@@ -16,10 +16,16 @@ use React\EventLoop\TimerInterface;
  * The request is held until the next pull for that team, the deadline, or the client going away, and then
  * answered with an empty 200 and "X-Accel-Redirect: /_mcp_result/<deadline>/<hop>?r=pull|timeout|busy", which
  * hands the request back to PHP. poker-msg sees no body, no headers that matter and no team id, only the hash.
+ *
+ * The same listener takes MCP reactions (section 8.6): "/_mcp_react/<team-hash>/<from-mkey>/<to-mkey>/<code>" is
+ * checked and distributed by MsgServer::reactFromMcp() (same rules as WebSocket reactions) and answered at once with
+ * "X-Accel-Redirect: /_mcp_result/react?r=ok|rate|quota&used=<codes>".
  */
 final class WaitServer implements HttpServerInterface {
     /** "/_mcp_wait/<team-hash>/<checked ms>/<deadline s>/<hop>"; nothing else is accepted */
     public const PATH_PATTERN = '#^/_mcp_wait/([0-9a-f]{32})/(\d{13})/(\d{10})/([1-3])$#D';
+    /** B-151: "/_mcp_react/<team-hash>/<from-mkey>/<to-mkey>/<code>" (mkeys and code as in MsgServer::parseReact) */
+    public const REACT_PATH_PATTERN = '#^/_mcp_react/([0-9a-f]{32})/([0-9]{1,10})/([0-9]{1,10})/(' . MsgServer::REACT_CODE_PATTERN . ')$#D';
     /** A waiter is never held longer than this (seconds), whatever the deadline says (nginx proxy_read_timeout 35s). */
     public const MAX_HOLD = 30.0;
     /**
@@ -34,6 +40,8 @@ final class WaitServer implements HttpServerInterface {
     private int $maxWait;
     /** @var callable(string): void */
     private $log;
+    /** @var (callable(string, string, string, string): array{0: string, 1: list<string>})|null MsgServer::reactFromMcp */
+    private $react = null;
 
     /** @var array<int, array{conn: ConnectionInterface, hash: string, deadline: string, hop: string, timer: TimerInterface}> */
     private array $waiters = [];
@@ -44,12 +52,39 @@ final class WaitServer implements HttpServerInterface {
     private float $lastPruneAt = 0.0;
 
     /** @var array<string, int> counters since the last log line */
-    private array $stats = ['started' => 0, 'pull' => 0, 'timeout' => 0, 'busy' => 0, 'aborted' => 0, 'invalid' => 0];
+    private array $stats = ['started' => 0, 'pull' => 0, 'timeout' => 0, 'busy' => 0, 'aborted' => 0, 'invalid' => 0,
+        'react_ok' => 0, 'react_rate' => 0, 'react_quota' => 0];
 
     public function __construct(LoopInterface $loop, int $maxWait, callable $log) {
         $this->loop = $loop;
         $this->maxWait = $maxWait;
         $this->log = $log;
+    }
+
+    /** B-151: handler for /_mcp_react/ (MsgServer::reactFromMcp); without one, reaction requests are invalid. */
+    public function setReactHandler(callable $react): void {
+        $this->react = $react;
+    }
+
+    /**
+     * Parses a reaction path; returns [hash, from, to, code] or null.
+     * @return array{0: string, 1: string, 2: string, 3: string}|null
+     */
+    public static function parseReactPath(string $path): ?array {
+        if (preg_match(self::REACT_PATH_PATTERN, $path, $m) !== 1) return null;
+        return [$m[1], $m[2], $m[3], $m[4]];
+    }
+
+    /**
+     * Raw HTTP response handing a reaction request back to PHP: r=ok|rate|quota, used = codes the thrower has thrown
+     * today in this team (comma-separated, sorted, empty if none).
+     * @param list<string> $used
+     */
+    public static function reactResponse(string $outcome, array $used): string {
+        return "HTTP/1.1 200 OK\r\n"
+            . "X-Accel-Redirect: /_mcp_result/react?r=$outcome&used=" . implode(',', $used) . "\r\n"
+            . "Content-Length: 0\r\n"
+            . "Connection: close\r\n\r\n";
     }
 
     /** Team hash as used in the wait URI: first 32 hex characters of sha256(team id). */
@@ -120,7 +155,7 @@ final class WaitServer implements HttpServerInterface {
             $id = $conn->resourceId ?? null;
             if ($id !== null) $this->remove($id);
             // No message: it might contain parts of the request. Class and place are enough to find the bug.
-            ($this->log)('ERROR: mcp wait request failed: ' . get_class($e) . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
+            ($this->log)('ERROR: mcp request failed: ' . get_class($e) . ' in ' . basename($e->getFile()) . ':' . $e->getLine());
             try { $conn->close(); } catch (\Throwable $ignored) {}
         }
     }
@@ -130,12 +165,15 @@ final class WaitServer implements HttpServerInterface {
             $conn->close();
             return;
         }
-        $parts = $request->getMethod() === 'GET' ? self::parsePath($request->getUri()->getPath()) : null;
+        $isGet = $request->getMethod() === 'GET';
+        $path = $request->getUri()->getPath();
+        if ($isGet && str_starts_with($path, '/_mcp_react/')) {
+            $this->handleReact($conn, $path);
+            return;
+        }
+        $parts = $isGet ? self::parsePath($path) : null;
         if ($parts === null) {
-            // Only PHP (through nginx) calls this; anything else gets no redirect. The URI is not logged.
-            $this->count('invalid');
-            $conn->send("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            $conn->close();
+            $this->reject($conn);
             return;
         }
         [$hash, $checked, $deadline, $hop] = $parts;
@@ -169,6 +207,26 @@ final class WaitServer implements HttpServerInterface {
         });
         $this->waiters[$id] = ['conn' => $conn, 'hash' => $hash, 'deadline' => $deadline, 'hop' => $hop, 'timer' => $timer];
         $this->byHash[$hash][$id] = true;
+    }
+
+    /** B-151: an MCP reaction; answered at once, nothing is held. */
+    private function handleReact(ConnectionInterface $conn, string $path): void {
+        $parts = self::parseReactPath($path);
+        $result = $parts === null || $this->react === null ? null : ($this->react)(...$parts);
+        if ($result === null || !in_array($result[0], ['ok', 'rate', 'quota'], true)) {
+            $this->reject($conn);
+            return;
+        }
+        $this->count('react_' . $result[0]);
+        $conn->send(self::reactResponse($result[0], $result[1]));
+        $conn->close();
+    }
+
+    /** Only PHP (through nginx) calls this; anything else gets 400 and no redirect. The URI is not logged. */
+    private function reject(ConnectionInterface $conn): void {
+        $this->count('invalid');
+        $conn->send("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        $conn->close();
     }
 
     public function onMessage(ConnectionInterface $from, $msg) {

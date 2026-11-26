@@ -10,6 +10,8 @@ class MsgServer implements MessageComponentInterface {
     protected $users;
     protected $user_cons;
     protected $user_subs;
+    /** @var array<int, string> resource id => team hash of its subscription (B-151, delivery of MCP reactions) */
+    private array $user_sub_hash = [];
 
     // B-81: pulls for the same team within this window (seconds) are merged into one trailing pull
     public const NOTIFY_WINDOW = 0.1;
@@ -43,10 +45,19 @@ class MsgServer implements MessageComponentInterface {
     // REACT_QUOTA_EXEMPT only have the rate limit. Counted in memory only; a restart resets the quota.
     public const REACT_DAILY_QUOTA = 1;
     public const REACT_QUOTA_EXEMPT = ['nudge'];
-    /** @var array<string, int> "<from>:<code>:<team>" => reactions forwarded on $reactQuotaDay */
+    /**
+     * Keyed by team hash (WaitServer::teamHash), so WebSocket and MCP throws of the same person share the quota
+     * (B-151: the MCP path only knows the hash).
+     * @var array<string, array<string, array<string, int>>> team hash => from => code => reactions on $reactQuotaDay
+     */
     private array $reactQuota = [];
     /** UTC day (Y-m-d) the counts in $reactQuota belong to */
     private string $reactQuotaDay = '';
+    // B-151: MCP reactions (/_mcp_react/) have no connection; their rate limit (REACT_LIMITS) is kept per team hash
+    // and thrower instead.
+    /** @var array<string, list<float>> "<team hash>:<from>" => times of the last forwarded MCP reactions */
+    private array $mcpReactTimes = [];
+    private float $mcpReactPrunedAt = 0.0;
 
     public function __construct() {
         $this->logMsg("Starting up MsgServer");
@@ -88,6 +99,7 @@ class MsgServer implements MessageComponentInterface {
                 $this->logMsg(".. added subscription on team '$team' for $from->resourceId");
                 $this->user_cons[$from->resourceId] = $from;
                 $this->user_subs[$from->resourceId] = $team;
+                $this->user_sub_hash[$from->resourceId] = WaitServer::teamHash($team);
                 $this->logActiveTeams();
             }
         } else if (str_starts_with($msg, 'react:')) {
@@ -114,58 +126,127 @@ class MsgServer implements MessageComponentInterface {
             return;
         }
         // B-131: only the validated code (REACT_CODE_PATTERN) is logged, never the mkeys
-        $code = substr($react, strrpos($react, ':') + 1);
-        $now = microtime(true);
-        $times = self::pruneReactTimes($this->lastReact[$id] ?? [], $now);
-        $hit = self::reactLimitHit($times, $now);
-        if ($hit !== null) {
-            $this->lastReact[$id] = $times;
+        [, $sender, , $code] = explode(':', $react);
+        $team = $this->user_subs[$id];
+        $hash = $this->user_sub_hash[$id];
+        $times = $this->lastReact[$id] ?? [];
+        $outcome = $this->reactAdmit($times, $hash, $sender, $code, microtime(true), $hit);
+        $this->lastReact[$id] = $times;
+        if ($outcome === 'rate') {
             $this->logMsg(".. ignored reaction '$code' from $id (rate limit $hit)");
             return;
         }
-        $this->lastReact[$id] = $times;
-        $team = $this->user_subs[$id];
-        // B-139: the from-mkey is the second field (format validated by parseReact)
-        $sender = explode(':', $react, 3)[1];
-        if (!$this->reactQuotaTake($team, $sender, $code, $now)) {
+        if ($outcome === 'quota') {
             $this->logMsg(".. ignored reaction '$code' from $id (daily quota)");
             return;
         }
-        $times[] = $now;
-        $this->lastReact[$id] = $times;
-        $cnt = 0;
-        foreach ($this->user_cons as $user) {
-            if (($this->user_subs[$user->resourceId] ?? null) === $team) {
-                $user->send($react);
-                $cnt++;
-            }
-        }
+        $cnt = $this->deliverReact($hash, $react);
         $this->logMsg(".. forwarded reaction '$code' to $cnt connection(s) of team '$team'");
     }
 
     /**
-     * B-139: counts one reaction of $code by sender $from in $team for the UTC day of $now and returns true,
-     * or returns false (nothing counted) if the daily quota is used up. Exempt codes always return true and are
-     * not counted. On the first call of a new UTC day all counts of the previous day are dropped.
+     * B-151: a reaction from the MCP server (internal HTTP endpoint /_mcp_react/, docs/mcp-concept.md 8.6 in the poker
+     * repo). PHP has checked the seat and set $from from the actor. Same rules as onReact (format, rate limit,
+     * daily quota); the rate limit is kept per team hash and thrower, because there is no connection. On success the
+     * reaction goes to every WebSocket connection subscribed to the team, exactly like a WebSocket reaction.
+     * Nothing is logged here (the endpoint only counts outcomes).
+     * @return array{0: string, 1: list<string>} outcome ('ok', 'rate', 'quota' or 'invalid') and the codes the
+     *         thrower has thrown today in this team (sorted)
+     */
+    public function reactFromMcp(string $hash, string $from, string $to, string $code): array {
+        $react = preg_match('/^[0-9a-f]{32}$/D', $hash) === 1 ? self::parseReact("react:$from:$to:$code") : null;
+        if ($react === null) return ['invalid', []];
+        [, $from, , $code] = explode(':', $react);
+        $now = microtime(true);
+        if ($now - $this->mcpReactPrunedAt >= 1.0) {   // keep the map small, at most once per second
+            $this->mcpReactPrunedAt = $now;
+            foreach ($this->mcpReactTimes as $k => $t) {
+                $t = self::pruneReactTimes($t, $now);
+                if ($t === []) unset($this->mcpReactTimes[$k]); else $this->mcpReactTimes[$k] = $t;
+            }
+        }
+        $key = "$hash:$from";
+        $times = $this->mcpReactTimes[$key] ?? [];
+        $outcome = $this->reactAdmit($times, $hash, $from, $code, $now, $hit);
+        if ($times === []) unset($this->mcpReactTimes[$key]); else $this->mcpReactTimes[$key] = $times;
+        if ($outcome === 'ok') $this->deliverReact($hash, $react);
+        return [$outcome, $this->reactQuotaUsed($hash, $from, $now)];
+    }
+
+    /**
+     * The rules for every reaction (B-131, B-139), shared by WebSocket (onReact) and MCP (reactFromMcp): rate limit
+     * over $times (the sender's forwarded reactions, oldest first; pruned and, on success, extended in place), then
+     * the daily quota of thrower $from in the team. Returns 'ok', 'rate' ($hit = window label) or 'quota'.
+     * Dropped reactions count for neither limit.
+     */
+    private function reactAdmit(array &$times, string $hash, string $from, string $code, float $now, ?string &$hit = null): string {
+        $times = self::pruneReactTimes($times, $now);
+        $hit = self::reactLimitHit($times, $now);
+        if ($hit !== null) return 'rate';
+        if (!$this->reactQuotaTake($hash, $from, $code, $now)) return 'quota';
+        $times[] = $now;
+        return 'ok';
+    }
+
+    /** Sends a validated reaction to every connection subscribed to the team with this hash; returns their number. */
+    private function deliverReact(string $hash, string $react): int {
+        $cnt = 0;
+        foreach ($this->user_cons as $user) {
+            if (($this->user_sub_hash[$user->resourceId] ?? null) === $hash) {
+                $user->send($react);
+                $cnt++;
+            }
+        }
+        return $cnt;
+    }
+
+    /** Number of entries in the MCP rate-limit state (for tests). */
+    public function mcpReactStateSize(): int {
+        return count($this->mcpReactTimes);
+    }
+
+    /**
+     * B-139: counts one reaction of $code by sender $from in the team (key: team hash) for the UTC day of $now and
+     * returns true, or returns false (nothing counted) if the daily quota is used up. Exempt codes always return true
+     * and are not counted. On the first call of a new UTC day all counts of the previous day are dropped.
      */
     public function reactQuotaTake(string $team, string $from, string $code, float $now): bool {
         if (in_array($code, self::REACT_QUOTA_EXEMPT, true)) return true;
+        $this->reactQuotaRoll($now);
+        $cnt = $this->reactQuota[$team][$from][$code] ?? 0;
+        if ($cnt >= self::REACT_DAILY_QUOTA) return false;
+        $this->reactQuota[$team][$from][$code] = $cnt + 1;
+        return true;
+    }
+
+    /**
+     * B-151: codes thrown today (UTC) by sender $from in the team (key: team hash), sorted. With REACT_DAILY_QUOTA = 1
+     * these are exactly the codes used up for today.
+     * @return list<string>
+     */
+    public function reactQuotaUsed(string $team, string $from, float $now): array {
+        $this->reactQuotaRoll($now);
+        $codes = array_keys($this->reactQuota[$team][$from] ?? []);
+        sort($codes);
+        return array_map('strval', $codes);
+    }
+
+    /** B-139: drops all counts when $now is on another UTC day than the counts. */
+    private function reactQuotaRoll(float $now): void {
         $day = gmdate('Y-m-d', (int)floor($now));
         if ($day !== $this->reactQuotaDay) {
             $this->reactQuota = [];
             $this->reactQuotaDay = $day;
         }
-        // from (digits) and code (letters) contain no ':', so the key is unambiguous for any team id
-        $key = "$from:$code:$team";
-        $cnt = $this->reactQuota[$key] ?? 0;
-        if ($cnt >= self::REACT_DAILY_QUOTA) return false;
-        $this->reactQuota[$key] = $cnt + 1;
-        return true;
     }
 
-    /** B-139: number of entries in the daily quota state (for tests). */
+    /** B-139: number of entries (team, thrower, code) in the daily quota state (for tests). */
     public function reactQuotaSize(): int {
-        return count($this->reactQuota);
+        $n = 0;
+        foreach ($this->reactQuota as $byFrom) {
+            foreach ($byFrom as $codes) $n += count($codes);
+        }
+        return $n;
     }
 
     /**
@@ -333,6 +414,7 @@ class MsgServer implements MessageComponentInterface {
 
     public function onClose(ConnectionInterface $conn) {
         unset($this->lastReact[$conn->resourceId]);
+        unset($this->user_sub_hash[$conn->resourceId]);
         unset($this->user_subs[$conn->resourceId]);
         unset($this->user_cons[$conn->resourceId]);
         unset($this->users[$conn->resourceId]);
@@ -344,6 +426,7 @@ class MsgServer implements MessageComponentInterface {
     public function onError(ConnectionInterface $conn, Exception $e) {
         if (isset($conn->resourceId)) {
             unset($this->lastReact[$conn->resourceId]);
+            unset($this->user_sub_hash[$conn->resourceId]);
             unset($this->user_subs[$conn->resourceId]);
             unset($this->user_cons[$conn->resourceId]);
             unset($this->users[$conn->resourceId]);

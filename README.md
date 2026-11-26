@@ -68,7 +68,9 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 * Effect: every connection subscribed to that team receives `pull`, the only way to trigger a `pull`
   (B-93: the former browser message `push` is ignored like any unknown message). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
   the end of the 100 ms window (so the last change is always loaded).
-  Notifications for teams without subscribers are dropped and only counted (logged at most once per minute).
+  Notifications for teams without subscribers (neither WebSocket connections nor MCP waiters, B-151) are dropped
+  and only counted (logged at most once per minute); only their time is kept for the race check of the wait endpoint.
+  Waiters of the MCP wait endpoint (below) are woken together with the WebSocket subscribers.
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
 * Security: bound to 127.0.0.1 only, but **every local process (any user) can send**. The worst a local sender can do
   is trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket
@@ -121,6 +123,61 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
   daily quota); acceptable for a fun feature.
   poker-msg forwards `from` as it comes; it attaches no meaning to it.
 
+### MCP wait endpoint (B-151)
+
+Holds the open `wait_for_change` requests of the MCP server (poker repo, `docs/mcp-concept.md`, section 8), so no
+PHP-FPM worker waits. PHP answers an unchanged `wait_for_change` with `X-Accel-Redirect: /_mcp_wait/...`; nginx
+proxies that internal location to this endpoint, which hands the request back to PHP with another
+`X-Accel-Redirect` when something happened. poker-msg never sees the request body or the client's headers
+(`proxy_pass_request_body off`, `proxy_pass_request_headers off`) and keeps no data besides the waiters.
+
+* Address: `http://127.0.0.1:8445` (always localhost; port via `POKER_MSG_HTTP_PORT`, `0` disables it). Plain
+  HTTP/1.1 in the same process and event loop (Ratchet `HttpServer` on a second socket, no extra dependency).
+* Request: `GET /_mcp_wait/<team-hash>/<checked>/<deadline>/<hop>`, nothing else (no query, no body needed):
+  * `team-hash`: first 32 hex characters (lower case) of `sha256(<team_id>)`, the team id of `pull:<team_id>`;
+  * `checked`: time in ms (13 digits) at which PHP computed the view;
+  * `deadline`: end of the wait, Unix seconds (10 digits);
+  * `hop`: `1`-`3`, the wait round within one MCP request (nginx allows at most 10 internal redirects).
+
+  Anything else (other path or method) gets `400` without redirect.
+* Answer: always `200`, `Content-Length: 0`, `Connection: close` and
+  `X-Accel-Redirect: /_mcp_result/<deadline>/<hop>?r=<reason>` (deadline and hop as received), with `<reason>`:
+  * `pull`: a pull notification for the team (same place and same 100 ms merging as the WebSocket `pull`);
+    also at once if the last notification for that team came at or after `checked` (race: a change written while
+    PHP was computing the view must not get lost; notification times are kept 60 s for every team, also without
+    subscribers);
+  * `timeout`: the deadline was reached (at once if it is already over; never held longer than 30 s);
+  * `busy`: at once if `POKER_MSG_MCP_MAX_WAIT` waiters (default 2000) are already waiting.
+* Client abort: nginx closes the upstream connection, the waiter is removed and its place is free again.
+* Log: only counters, once per minute if anything happened, e.g.
+  `mcp_wait: waiting=3, started=40, pull=25, timeout=12, busy=0, aborted=1, invalid=0` - never URIs, hashes or team ids.
+* Security: bound to 127.0.0.1; a local process can call it, but only gets a header text back (the result location
+  of nginx is `internal`). If the port cannot be bound, the error is logged and WebSocket and UDP keep running
+  (nginx then answers via `@mcp_wait_failed`, PHP reports `busy`).
+
+nginx (in the poker server block; the poker repo has the complete setup in `docs/mcp-concept.md`, section 8.4):
+
+ ```
+location ^~ /_mcp_wait/ {
+    internal;
+    proxy_pass http://127.0.0.1:8445;
+    proxy_http_version 1.1;
+    proxy_pass_request_body off;
+    proxy_pass_request_headers off;
+    proxy_set_header Content-Length "";
+    proxy_read_timeout 35s;
+    error_page 502 504 = @mcp_wait_failed;
+}
+ ```
+
+Check on the server: `ss -ltnp | grep ':8445'`, and
+`curl -si 127.0.0.1:8445/_mcp_wait/$(printf test | sha256sum | cut -c1-32)/$(date +%s%3N)/$(( $(date +%s) + 3 ))/1`
+answers after 3 s with `X-Accel-Redirect: /_mcp_result/<deadline>/1?r=timeout`, or earlier with `r=pull` after
+`printf 'pull:test' | nc -u -w1 127.0.0.1 8444`.
+
+Connections: every waiter is one socket in poker-msg (and two in nginx), so 2000 waiters fit next to the
+WebSockets into `ulimit -n 20000` of the supervisor config.
+
 ### Environment variables
 
 | Variable | Default | Meaning |
@@ -129,11 +186,14 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
 | `POKER_MSG_KEEPALIVE` | `30` | ping interval in seconds |
 | `POKER_MSG_HEARTBEAT` | `30` | `hb` interval in seconds, `0` = off |
 | `POKER_MSG_NOTIFY_PORT` | `8444` | UDP notification port (127.0.0.1) |
+| `POKER_MSG_HTTP_PORT` | `8445` | MCP wait endpoint (HTTP, 127.0.0.1), `0` = off (B-151) |
+| `POKER_MSG_MCP_MAX_WAIT` | `2000` | maximum concurrent MCP waiters, more get `r=busy` (B-151) |
 
 ### Tests
 
-`php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18446 and checks pull
-distribution, UDP notifications, reactions, heartbeats and a failing UDP bind. Exit code 0 means all passed.
+`php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18448 and checks pull
+distribution, UDP notifications, reactions, heartbeats, the MCP wait endpoint (wake on pull, race check, deadline,
+`busy`, abort) and failing UDP/HTTP binds. Exit code 0 means all passed.
 
 Here is an example supervisor config:
  ```

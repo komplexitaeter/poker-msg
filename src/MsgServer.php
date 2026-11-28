@@ -85,18 +85,19 @@ class MsgServer implements MessageComponentInterface {
     public function onMessage(ConnectionInterface $from, $msg) {
         $msg = trim((string)$msg);
         // Reactions (B-110) are logged by onReact() with their validated code only (B-131), never the mkeys.
+        // B-159: never the team id in clear text (subscribe: only its hash prefix, see teamForLog())
         if (!str_starts_with($msg, 'react:')) {
-            $this->logMsg("New message from $from->resourceId is: " . self::forLog($msg));
+            $this->logMsg("New message from $from->resourceId is: " . self::messageForLog($msg));
         }
         // The client sends exactly "subscribe: <team_id>" (script.js) and "react:..." (B-110).
         // B-93: "push" is no longer supported (since B-81 the API notifies via UDP); like any other unknown
-        // message it is ignored and only shows up in the "New message" log line above (without team id).
+        // message it is ignored and only shows up in the "New message" log line above (only up to its first ':').
         if (str_starts_with($msg, 'subscribe:')) {
             $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
             if ($team === null) {
                 $this->logMsg(".. ignored subscription with invalid team id from $from->resourceId");
             } else {
-                $this->logMsg(".. added subscription on team '$team' for $from->resourceId");
+                $this->logMsg(".. added subscription on team '" . self::teamForLog($team) . "' for $from->resourceId");
                 $this->user_cons[$from->resourceId] = $from;
                 $this->user_subs[$from->resourceId] = $team;
                 $this->user_sub_hash[$from->resourceId] = WaitServer::teamHash($team);
@@ -141,7 +142,7 @@ class MsgServer implements MessageComponentInterface {
             return;
         }
         $cnt = $this->deliverReact($hash, $react);
-        $this->logMsg(".. forwarded reaction '$code' to $cnt connection(s) of team '$team'");
+        $this->logMsg(".. forwarded reaction '$code' to $cnt connection(s) of team '" . self::teamForLog($team) . "'");
     }
 
     /**
@@ -319,7 +320,7 @@ class MsgServer implements MessageComponentInterface {
         // Nobody is watching this team (no WebSocket subscriber, no MCP waiter): drop early,
         // no log line per notification, no further state.
         if (!in_array($team, $this->user_subs, true) && !($this->wait?->hasWaiters($team))) {
-            $this->countIgnored('notification(s) for teams without subscribers', "last one for '$team'");
+            $this->countIgnored('notification(s) for teams without subscribers', "last one for '" . self::teamForLog($team) . "'");
             return;
         }
 
@@ -372,7 +373,7 @@ class MsgServer implements MessageComponentInterface {
             $this->lastNotify = array_filter($this->lastNotify, fn($t) => $now - $t < self::NOTIFY_WINDOW);
             $this->lastNotify[$team] = $now;
         }
-        $this->logMsg("New notification: pull for team '$team'" . ($merged > 1 ? " ($merged merged)" : ""));
+        $this->logMsg("New notification: pull for team '" . self::teamForLog($team) . "'" . ($merged > 1 ? " ($merged merged)" : ""));
         $this->pullTeam($team);
         $this->wait?->wake($team);
     }
@@ -381,6 +382,27 @@ class MsgServer implements MessageComponentInterface {
     public static function forLog(string $text, int $max = 120): string {
         $clean = preg_replace('/[^\x20-\x7E]/', '?', $text) ?? '';
         return strlen($clean) > $max ? substr($clean, 0, $max) . '...' : $clean;
+    }
+
+    /**
+     * B-159: a team id for the log - the first 8 hex of its sha256, never the id itself (the team id is the only
+     * secret of a board). Enough to follow one team through the log; the same team gives the same value.
+     */
+    public static function teamForLog(string $team): string {
+        return substr(hash('sha256', $team), 0, 8);
+    }
+
+    /**
+     * B-159: a client message for the log: "subscribe:" with the hash prefix of the team id (teamForLog()), anything
+     * else (unknown, e.g. the old "push:<team_id>") only up to its first ':' - it may carry a team id as well.
+     */
+    public static function messageForLog(string $msg): string {
+        if (str_starts_with($msg, 'subscribe:')) {
+            $team = self::parseTeamId(substr($msg, strlen('subscribe:')));
+            return 'subscribe:' . ($team === null ? '(invalid)' : self::teamForLog($team));
+        }
+        $colon = strpos($msg, ':');
+        return $colon === false ? self::forLog($msg, 40) : self::forLog(substr($msg, 0, $colon), 40) . ':...';
     }
 
     /** Team id: 1-80 printable ASCII characters without whitespace (pok_teams_tbl.id is varchar(80)), else null. */

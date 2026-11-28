@@ -4,6 +4,8 @@ use Ratchet\Http\HttpServer;
 use Ratchet\Server\IoServer;
 use PokerMsg\MsgServer;
 use PokerMsg\NotifySocket;
+use PokerMsg\WaitServer;
+use PokerMsg\HeaderTimeout;
 
 require dirname(__DIR__) . '/vendor/autoload.php';
 
@@ -21,6 +23,12 @@ $heartbeatInterval = (float)(getenv('POKER_MSG_HEARTBEAT') ?: 30);
 
 // B-81: local UDP port for notifications from the web server ("pull:<team_id>"), bound to 127.0.0.1 only.
 $notifyPort = (int)(getenv('POKER_MSG_NOTIFY_PORT') ?: 8444);
+
+// B-151: internal HTTP endpoint for MCP wait_for_change and react (127.0.0.1 only, nginx /_mcp_wait/, /_mcp_react/), 0 = off.
+// getenv() instead of "?:" here, because "0" is a valid value.
+$waitPort = getenv('POKER_MSG_HTTP_PORT') !== false && getenv('POKER_MSG_HTTP_PORT') !== '' ? (int)getenv('POKER_MSG_HTTP_PORT') : 8445;
+// B-151: at most this many concurrent waiters, further requests are answered with r=busy at once.
+$maxWait = getenv('POKER_MSG_MCP_MAX_WAIT') !== false && getenv('POKER_MSG_MCP_MAX_WAIT') !== '' ? (int)getenv('POKER_MSG_MCP_MAX_WAIT') : 2000;
 
 $msgServer = new MsgServer;
 $ws = new WsServer($msgServer);
@@ -55,6 +63,27 @@ if ($notify->stream === null) {
     if (!$notify->exclusive) {
         $msgServer->logMsg("WARNING: PHP extension sockets missing, notify port is not bound exclusively (other local processes could bind it too)");
     }
+}
+
+if ($waitPort > 0) {
+    // A failing bind is logged; WebSocket and UDP keep running (wait_for_change then answers "busy" via nginx).
+    try {
+        $waitSocket = new React\Socket\Server("127.0.0.1:$waitPort", $server->loop);
+        $waitServer = new WaitServer($server->loop, $maxWait, [$msgServer, 'logMsg']);
+        // Connections without complete headers after 5 s are closed (nginx sends them at once).
+        new IoServer(new HeaderTimeout(new HttpServer($waitServer), $server->loop, 5.0), $waitSocket, $server->loop);
+        $msgServer->setWaitServer($waitServer);
+        // B-151: MCP reactions (/_mcp_react/) on the same listener, same rules as WebSocket reactions
+        $waitServer->setReactHandler([$msgServer, 'reactFromMcp']);
+        $server->loop->addPeriodicTimer(WaitServer::LOG_INTERVAL, function () use ($waitServer) {
+            $waitServer->logStats();
+        });
+        $msgServer->logMsg("MCP wait endpoint listening on http://127.0.0.1:$waitPort (max $maxWait waiters)");
+    } catch (\Throwable $e) {
+        $msgServer->logMsg("ERROR: MCP wait endpoint 127.0.0.1:$waitPort not available (" . MsgServer::forLog($e->getMessage(), 300) . "), continuing without it");
+    }
+} else {
+    $msgServer->logMsg("MCP wait endpoint disabled (POKER_MSG_HTTP_PORT=0)");
 }
 
 $msgServer->logMsg("WebSocket server listening on 127.0.0.1:$wsPort (keepalive {$keepAliveInterval}s, heartbeat {$heartbeatInterval}s)");

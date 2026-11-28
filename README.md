@@ -68,7 +68,9 @@ Besides the WebSocket port the server listens on a local UDP port for notificati
 * Effect: every connection subscribed to that team receives `pull`, the only way to trigger a `pull`
   (B-93: the former browser message `push` is ignored like any unknown message). Notifications for the same team within 100 ms are merged: one `pull` at once, one more at
   the end of the 100 ms window (so the last change is always loaded).
-  Notifications for teams without subscribers are dropped and only counted (logged at most once per minute).
+  Notifications for teams without subscribers (neither WebSocket connections nor MCP waiters, B-151) are dropped
+  and only counted (logged at most once per minute); only their time is kept for the race check of the wait endpoint.
+  Waiters of the MCP wait endpoint (below) are woken together with the WebSocket subscribers.
 * Fire and forget: no answer, no delivery guarantee. The sender never blocks, even if poker-msg is not running.
 * Security: bound to 127.0.0.1 only, but **every local process (any user) can send**. The worst a local sender can do
   is trigger additional reloads. If the port cannot be bound (e.g. in use), the error is logged and the WebSocket
@@ -94,6 +96,8 @@ code), delivery only within the sender's own team, and the rate limit. What a me
 sender and receiver (the boards); poker-msg knows no meanings and no data.
 
 Reactions are sent directly over the WebSocket; nothing is stored, there is no PHP endpoint and no statistics.
+Agents of the MCP server throw reactions through the internal endpoint `/_mcp_react/` (below, B-151) with the same
+rules.
 
 * Browser → server: `react:<from-mkey>:<to-mkey>:<code>`, e.g. `react:12:345:heart`. The connection must be
   subscribed (`subscribe:<team_id>`) before. The board sends `0` as `from` itself
@@ -117,9 +121,123 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
 * Log (B-131): only the validated code is logged, never `from`/`to` or anything else, e.g.
   `.. forwarded reaction 'thumbsup' to 5 connection(s) of team '<team_id>'` and
   `.. ignored reaction 'thumbsup' from 42 (rate limit 1s)` (or `1m`).
-* `from` is not verified (any team member could send in someone else's name and so also use up someone else's
-  daily quota); acceptable for a fun feature.
+* `from` is not verified on the WebSocket (any team member could send in someone else's name and so also use up
+  someone else's daily quota); acceptable for a fun feature. On the MCP path PHP sets `from` from the seat.
   poker-msg forwards `from` as it comes; it attaches no meaning to it.
+
+### MCP wait endpoint (B-151)
+
+Holds the open `wait_for_change` requests of the MCP server (poker repo, `docs/mcp-concept.md`, section 8), so no
+PHP-FPM worker waits. PHP answers an unchanged `wait_for_change` with `X-Accel-Redirect: /_mcp_wait/...`; nginx
+proxies that internal location to this endpoint, which hands the request back to PHP with another
+`X-Accel-Redirect` when something happened. poker-msg never sees the request body or the client's headers
+(`proxy_pass_request_body off`, `proxy_pass_request_headers off`) and keeps no data besides the waiters.
+
+* Address: `http://127.0.0.1:8445` (always localhost; port via `POKER_MSG_HTTP_PORT`, `0` disables it). Plain
+  HTTP/1.1 in the same process and event loop (Ratchet `HttpServer` on a second socket, no extra dependency).
+* Request: `GET /_mcp_wait/<team-hash>/<checked>/<deadline>/<hop>`, nothing else (no query, no body needed):
+  * `team-hash`: first 32 hex characters (lower case) of `sha256(<team_id>)`, the team id of `pull:<team_id>`;
+  * `checked`: time in ms (13 digits) at which PHP computed the view;
+  * `deadline`: end of the wait, Unix seconds (10 digits);
+  * `hop`: `1`-`3`, the wait round within one MCP request (nginx allows at most 10 internal redirects).
+
+  Anything else (other path or method) gets `400` without redirect.
+* Answer: always `200`, `Content-Length: 0`, `Connection: close` and
+  `X-Accel-Redirect: /_mcp_result/<deadline>/<hop>?r=<reason>` (deadline and hop as received), with `<reason>`:
+  * `pull`: a pull notification for the team (same place and same 100 ms merging as the WebSocket `pull`);
+    also at once if the last notification for that team came at or after `checked` (race: a change written while
+    PHP was computing the view must not get lost; notification times are kept 10 s for every team, also without
+    subscribers);
+  * `timeout`: the deadline was reached (at once if it is already over; never held longer than 30 s);
+  * `busy`: at once if `POKER_MSG_MCP_MAX_WAIT` waiters (default 2000) are already waiting.
+* Client abort: nginx closes the upstream connection, the waiter is removed and its place is free again.
+* Connections without complete HTTP headers after 5 s are closed (nginx sends them at once). An unexpected error
+  while handling a request is caught, logged (class and place only) and closes only that connection.
+* Log: only counters, once per minute if anything happened, e.g.
+  `mcp_wait: waiting=3, started=40, pull=25, timeout=12, busy=0, aborted=1, invalid=0, react_ok=4, react_rate=0, react_quota=1`
+  - never URIs, hashes, mkeys or team ids (`invalid` counts invalid wait and react requests).
+* Security: bound to 127.0.0.1; a local process can call it, but only gets a header text back (the result location
+  of nginx is `internal`). If the port cannot be bound, the error is logged and WebSocket and UDP keep running
+  (nginx then answers via `@mcp_wait_failed`, PHP reports `busy`).
+
+nginx (in the poker server block; the poker repo has the complete setup in `docs/mcp-concept.md`, section 8.4):
+
+ ```
+location ^~ /_mcp_wait/ {
+    internal;
+    proxy_pass http://127.0.0.1:8445;
+    proxy_http_version 1.1;
+    proxy_pass_request_body off;
+    proxy_pass_request_headers off;
+    proxy_set_header Content-Length "";
+    proxy_read_timeout 35s;
+    error_page 502 504 = @mcp_wait_failed;
+}
+ ```
+
+Check on the server: `ss -ltnp | grep ':8445'`, and
+`curl -si 127.0.0.1:8445/_mcp_wait/$(printf test | sha256sum | cut -c1-32)/$(date +%s%3N)/$(( $(date +%s) + 3 ))/1`
+answers after 3 s with `X-Accel-Redirect: /_mcp_result/<deadline>/1?r=timeout`, or earlier with `r=pull` after
+`printf 'pull:test' | nc -u -w1 127.0.0.1 8444`.
+
+### MCP react endpoint (B-151)
+
+The MCP tool `react` (poker repo, `docs/mcp-concept.md`, section 8.6) throws a reaction like the smiley on the web
+board. PHP checks the seat, the recipient and the code and answers only with
+`X-Accel-Redirect: /_mcp_react/...`; nginx proxies that internal location to the same listener as the wait endpoint
+(`127.0.0.1:8445`), which answers at once (nothing is held) with another `X-Accel-Redirect` back to PHP.
+
+* Request: `GET /_mcp_react/<team-hash>/<from-mkey>/<to-mkey>/<code>`, nothing else (no body, no headers needed),
+  checked against `^/_mcp_react/[0-9a-f]{32}/[0-9]{1,10}/[0-9]{1,10}/[a-z]{1,12}$`:
+  * `team-hash`: first 32 hex characters (lower case) of `sha256(<team_id>)`, as for `/_mcp_wait/`;
+  * `from-mkey`: the thrower, **set by PHP from the seat of the caller** (never taken from the agent), 1-10 digits;
+    PHP sends `0` for an anonymous nudge like the board does (then the rate limit is shared by all anonymous MCP
+    throws of the team);
+  * `to-mkey`: the recipient, 1-10 digits;
+  * `code`: 1-12 lower-case letters `a-z`, must not contain `pull` (same check as the WebSocket path).
+
+  All parts are plain ASCII from these character sets, so nothing is percent-encoded. Only the path is checked (a
+  query string is ignored). Any other path or method gets `400` without redirect (nginx would pass it to the
+  client; PHP validates before, so this only happens on a bug).
+* Rules: exactly those of WebSocket reactions, same code: format, rate limit `REACT_LIMITS` (3/s, 10/min; here per
+  team hash and `from`, as there is no connection), daily quota `REACT_DAILY_QUOTA` per code, thrower and UTC day
+  (`nudge` exempt). The quota is counted per team hash and `from` for both paths, so a browser and an agent with the
+  same mkey share it. Dropped reactions count for neither limit.
+* Effect on `ok`: `react:<from-mkey>:<to-mkey>:<code>` goes to every WebSocket connection subscribed to the team
+  (the hash of its subscribed team id matches), exactly like a WebSocket reaction. A team without subscribers gets
+  `ok` as well (counted, nobody to deliver to).
+* Answer: always `200`, `Content-Length: 0`, `Connection: close` and
+  `X-Accel-Redirect: /_mcp_result/react?r=<outcome>&used=<codes>`:
+  * `r`: `ok` (distributed), `rate` (rate limit hit, nothing counted) or `quota` (code already thrown today);
+  * `used`: codes the thrower has thrown today (UTC) in this team, after this throw, sorted and comma-separated,
+    empty if none (`used=`), e.g. `r=ok&used=cake,heart`. `nudge` is never listed. With `REACT_DAILY_QUOTA = 1`
+    these are exactly the codes left for today = all codes minus `used`.
+* Errors: an unexpected error is caught, logged (class and place only) and closes only that connection (nginx then
+  answers `502`, i.e. `error_page 502 504` of the location applies). Not reachable at all: the same.
+* Log: only the counters `react_ok`, `react_rate`, `react_quota` in the `mcp_wait:` line above, no line per
+  reaction, no hashes, mkeys or codes.
+
+nginx (in the poker server block, like `/_mcp_wait/`; the fallback location is up to the poker side):
+
+ ```
+location ^~ /_mcp_react/ {
+    internal;
+    proxy_pass http://127.0.0.1:8445;
+    proxy_http_version 1.1;
+    proxy_pass_request_body off;
+    proxy_pass_request_headers off;
+    proxy_set_header Content-Length "";
+    proxy_read_timeout 5s;
+    error_page 502 504 = @mcp_react_failed;
+}
+ ```
+
+Check on the server:
+`curl -si 127.0.0.1:8445/_mcp_react/$(printf test | sha256sum | cut -c1-32)/1/2/heart` answers
+`X-Accel-Redirect: /_mcp_result/react?r=ok&used=heart`, the second call `r=quota&used=heart`.
+
+Connections: every waiter is one socket in poker-msg (and two in nginx), so 2000 waiters fit next to the
+WebSockets into `ulimit -n 20000` of the supervisor config.
 
 ### Environment variables
 
@@ -129,11 +247,15 @@ Reactions are sent directly over the WebSocket; nothing is stored, there is no P
 | `POKER_MSG_KEEPALIVE` | `30` | ping interval in seconds |
 | `POKER_MSG_HEARTBEAT` | `30` | `hb` interval in seconds, `0` = off |
 | `POKER_MSG_NOTIFY_PORT` | `8444` | UDP notification port (127.0.0.1) |
+| `POKER_MSG_HTTP_PORT` | `8445` | MCP wait and react endpoint (HTTP, 127.0.0.1), `0` = off (B-151) |
+| `POKER_MSG_MCP_MAX_WAIT` | `2000` | maximum concurrent MCP waiters, more get `r=busy` (B-151) |
 
 ### Tests
 
-`php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18446 and checks pull
-distribution, UDP notifications, reactions, heartbeats and a failing UDP bind. Exit code 0 means all passed.
+`php tests/run-tests.php` (after `composer install`) starts the server on ports 18443-18448 and checks pull
+distribution, UDP notifications, reactions, heartbeats, the MCP wait endpoint (wake on pull, race check, deadline,
+`busy`, abort), the MCP react endpoint (`ok`/`rate`/`quota`, quota shared with WebSocket throws, distribution,
+invalid paths, errors) and failing UDP/HTTP binds. Exit code 0 means all passed.
 
 Here is an example supervisor config:
  ```

@@ -86,8 +86,8 @@ Sending from PHP:
  if ($sock !== false) { @fwrite($sock, 'pull:' . $team_id); fclose($sock); }
  ```
 
-Test on the server: `printf 'pull:test' | nc -u -w1 127.0.0.1 8444` writes `New notification: pull for team 'test'`
-to the info log; `ss -ulpn | grep 8444` shows the listener.
+Test on the server: `printf 'pull:test' | nc -u -w1 127.0.0.1 8444` writes `New notification: pull for team '9f86d081'`
+to the info log (B-159: team ids only as the first 8 hex of their sha256, `MsgServer::teamForLog()`; for `test`); `ss -ulpn | grep 8444` shows the listener.
 
 ### Reactions (B-110)
 
@@ -119,7 +119,7 @@ rules.
   Counted in memory only (cleared on the first reaction of a new UTC day, reset by a restart), log line
   `.. ignored reaction 'heart' from 42 (daily quota)`.
 * Log (B-131): only the validated code is logged, never `from`/`to` or anything else, e.g.
-  `.. forwarded reaction 'thumbsup' to 5 connection(s) of team '<team_id>'` and
+  `.. forwarded reaction 'thumbsup' to 5 connection(s) of team '<hash prefix>'` and
   `.. ignored reaction 'thumbsup' from 42 (rate limit 1s)` (or `1m`).
 * `from` is not verified on the WebSocket (any team member could send in someone else's name and so also use up
   someone else's daily quota); acceptable for a fun feature. On the MCP path PHP sets `from` from the seat.

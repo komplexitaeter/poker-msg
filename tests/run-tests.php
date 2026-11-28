@@ -192,6 +192,11 @@ check(MsgServer::parseNotify("pull:t\xC3\xA4m") === null, 'non-ASCII rejected');
 check(MsgServer::parseTeamId(' Team_4b ') === 'Team_4b', 'parseTeamId trims (client sends "subscribe: <id>")');
 check(MsgServer::forLog("a\nb\r\x00c") === 'a?b??c', 'forLog replaces line breaks and control characters');
 check(MsgServer::forLog(str_repeat('x', 500)) === str_repeat('x', 120) . '...', 'forLog shortens long input');
+check(MsgServer::teamForLog('test') === '9f86d081', 'teamForLog: first 8 hex of sha256 (B-159)');
+check(MsgServer::messageForLog('subscribe: Team_4b') === 'subscribe:' . MsgServer::teamForLog('Team_4b'), 'messageForLog hashes the subscribed team (B-159)');
+check(MsgServer::messageForLog("subscribe:a b") === 'subscribe:(invalid)', 'messageForLog: invalid team id not logged');
+check(MsgServer::messageForLog('push:secretTeam') === 'push:...', 'messageForLog: unknown messages only up to the first colon');
+check(MsgServer::messageForLog("hello\nFAKE") === 'hello?FAKE', 'messageForLog: no line breaks');
 
 echo "parseReact (B-110)\n";
 foreach (['cake', 'heart', 'clap', 'party', 'think', 'thumbs', 'fish', 'coffee', 'bomb', 'a', 'abcdefghijkl'] as $code) {
@@ -524,9 +529,13 @@ try {
     check(!str_contains($logText, 'react:'), 'reaction content is not logged');
     check(str_contains($logText, ".. ignored reaction 'wave' from ") && !str_contains($logText, ".. ignored reaction 'clap' from ")
         && preg_match("/ignored reaction 'wave' from \\d+ \\(rate limit 1s\\)$/m", $logText) === 1, 'dropped reactions logged with code and window (B-131)');
-    check(str_contains($logText, ".. forwarded reaction 'cake' to 2 connection(s) of team 'teamA'"), 'forwarded reactions logged with code (B-131)');
+    $teamALog = MsgServer::teamForLog('teamA');
+    check(str_contains($logText, ".. forwarded reaction 'cake' to 2 connection(s) of team '$teamALog'"), 'forwarded reactions logged with code (B-131)');
     check(!str_contains($logText, '11:22') && !str_contains($logText, '5:6'), 'mkeys of reactions are not logged');
-    check(str_contains($logText, "pull for team 'teamA' (4 merged)"), 'merged notifications logged once');
+    check(str_contains($logText, "pull for team '$teamALog' (4 merged)"), 'merged notifications logged once');
+    check(str_contains($logText, "is: subscribe:$teamALog") && str_contains($logText, "subscription on team '$teamALog'"), 'subscriptions logged with the hash prefix (B-159)');
+    check(!str_contains($logText, 'teamA') && !str_contains($logText, 'teamB'), 'no team id in clear text in the log (B-159)');
+    check(preg_match('/active_users=\d+$/m', $logText) === 1 && preg_match('/active_teams=\d+$/m', $logText) === 1, 'active_users/active_teams lines unchanged (cron script)');
     check(!str_contains($logText, 'WARNING: PHP extension sockets missing') || !function_exists('socket_create'), 'no fallback warning when sockets is available');
 } finally {
     stopServer($proc);
